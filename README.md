@@ -1,6 +1,6 @@
 # iCOUNTER API — CI/CD Pipeline on AWS + Kubernetes
 
-Production-style CI/CD pipeline using Jenkins to deploy a containerized Node.js Express API to Amazon EKS, exposed via AWS ALB, with Karpenter-based autoscaling and scale-to-zero capability.
+Production-style CI/CD pipeline using Jenkins to deploy a containerized Node.js Express API to Amazon EKS, exposed via AWS ALB, with Karpenter-based node provisioning (on-demand) and scale-to-zero capability.
 
 ## Architecture
 
@@ -35,7 +35,7 @@ Internet ──> AWS ALB (Ingress) ──> K8s Service ──> Pods (:3000)
 | CI/CD | Jenkins (Declarative Pipeline) |
 | Container Registry | AWS ECR |
 | Kubernetes | Amazon EKS (v1.29) |
-| Node Provisioning | Karpenter (spot + on-demand) |
+| Node Provisioning | Karpenter (on-demand) |
 | System Pods | AWS Fargate |
 | Load Balancer | AWS ALB (via AWS Load Balancer Controller) |
 | Pod Autoscaling | HPA (CPU + Memory) |
@@ -102,7 +102,7 @@ aws eks update-kubeconfig --name icounter-cluster --region ap-south-1
 | VPC | 10.0.0.0/16, 2 AZs, single NAT gateway |
 | EKS | v1.29, Fargate profiles for kube-system + karpenter |
 | ECR | `icounter-api` repository with lifecycle policy |
-| Karpenter | Spot-preferred, scale-to-zero, consolidation enabled |
+| Karpenter | On-demand, scale-to-zero, consolidation enabled |
 | ALB Controller | Deployed via Helm, IRSA authentication |
 | Metrics Server | Enables HPA pod autoscaling |
 
@@ -114,7 +114,7 @@ aws eks update-kubeconfig --name icounter-cluster --region ap-south-1
 | Fargate (system pods) | ~$29 |
 | NAT Gateway | ~$32 |
 | **Idle Total** | **~$134** |
-| Spot nodes (when active) | ~$5-15 (60-90% off on-demand) |
+| On-demand nodes (when active) | ~$30-60 (t3.medium ~$0.0416/hr) |
 | ALB (when active) | ~$16 |
 
 ### Teardown
@@ -184,7 +184,7 @@ helm upgrade --install icounter-api ./helm/icounter-api \
 - Creates namespace if it doesn't exist
 - Uses environment-specific values file (staging/production)
 - `--wait` ensures pipeline reports success only after pods are healthy
-- Karpenter automatically provisions a spot node when pods are scheduled
+- Karpenter automatically provisions an on-demand node when pods are scheduled
 
 ### Stage 7: Verify Deployment
 ```bash
@@ -343,19 +343,15 @@ HPA monitors pod CPU and memory utilization via the metrics-server. When average
 ### Karpenter (Node Autoscaler)
 
 **Instance Selection:**
-- Preferred: Spot instances (60-90% cheaper than on-demand)
-- Fallback: On-demand instances
+- Capacity type: On-demand (stable, no interruptions)
 - Instance types: t3.small, t3.medium, t3a.small, t3a.medium, m5.large, m5a.large
-- Diverse families ensure spot availability across at least one type
+- Karpenter picks the most cost-effective instance type that fits the pending pod requirements
 
 **Scale-to-Zero:**
 When all application pods are removed (e.g., `helm uninstall`), Karpenter terminates all nodes within 30 seconds. System pods continue running on Fargate (no EC2 cost).
 
 **Consolidation:**
 Karpenter continuously monitors node utilization. If pods can be packed onto fewer nodes, it cordons the underutilized node, reschedules pods, and terminates it. This keeps compute costs minimal.
-
-**Spot Interruption Handling:**
-An SQS queue receives EC2 spot interruption warnings via EventBridge. Karpenter drains the affected node and provisions a replacement before the interruption occurs.
 
 **Safety Limits:**
 - Max 10 CPU cores across all Karpenter-managed nodes

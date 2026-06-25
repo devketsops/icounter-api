@@ -47,7 +47,6 @@ resource "aws_iam_role_policy" "karpenter_controller" {
           "ec2:DescribeInstanceTypes",
           "ec2:DescribeLaunchTemplates",
           "ec2:DescribeSecurityGroups",
-          "ec2:DescribeSpotPriceHistory",
           "ec2:DescribeSubnets",
           "ec2:RunInstances",
           "ec2:TerminateInstances",
@@ -55,9 +54,9 @@ resource "aws_iam_role_policy" "karpenter_controller" {
         Resource = "*"
       },
       {
-        Sid    = "PassNodeRole"
-        Effect = "Allow"
-        Action = "iam:PassRole"
+        Sid      = "PassNodeRole"
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
         Resource = var.karpenter_node_role_arn
       },
       {
@@ -84,105 +83,8 @@ resource "aws_iam_role_policy" "karpenter_controller" {
         ]
         Resource = "*"
       },
-      {
-        Sid    = "SQS"
-        Effect = "Allow"
-        Action = [
-          "sqs:DeleteMessage",
-          "sqs:GetQueueAttributes",
-          "sqs:GetQueueUrl",
-          "sqs:ReceiveMessage",
-        ]
-        Resource = aws_sqs_queue.karpenter_interruption.arn
-      },
     ]
   })
-}
-
-# --- SQS Queue for Spot Interruption Handling ---
-
-resource "aws_sqs_queue" "karpenter_interruption" {
-  name                      = "${var.project_name}-karpenter-interruption"
-  message_retention_seconds = 300
-  sqs_managed_sse_enabled   = true
-
-  tags = {
-    Environment = var.environment
-  }
-}
-
-resource "aws_sqs_queue_policy" "karpenter_interruption" {
-  queue_url = aws_sqs_queue.karpenter_interruption.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "EC2InterruptionPolicy"
-        Effect = "Allow"
-        Principal = {
-          Service = ["events.amazonaws.com", "sqs.amazonaws.com"]
-        }
-        Action   = "sqs:SendMessage"
-        Resource = aws_sqs_queue.karpenter_interruption.arn
-      }
-    ]
-  })
-}
-
-# EventBridge rules for spot interruption events
-resource "aws_cloudwatch_event_rule" "spot_interruption" {
-  name = "${var.project_name}-karpenter-spot-interruption"
-
-  event_pattern = jsonencode({
-    source      = ["aws.ec2"]
-    detail-type = ["EC2 Spot Instance Interruption Warning"]
-  })
-
-  tags = {
-    Environment = var.environment
-  }
-}
-
-resource "aws_cloudwatch_event_target" "spot_interruption" {
-  rule = aws_cloudwatch_event_rule.spot_interruption.name
-  arn  = aws_sqs_queue.karpenter_interruption.arn
-}
-
-resource "aws_cloudwatch_event_rule" "instance_rebalance" {
-  name = "${var.project_name}-karpenter-instance-rebalance"
-
-  event_pattern = jsonencode({
-    source      = ["aws.ec2"]
-    detail-type = ["EC2 Instance Rebalance Recommendation"]
-  })
-
-  tags = {
-    Environment = var.environment
-  }
-}
-
-resource "aws_cloudwatch_event_target" "instance_rebalance" {
-  rule = aws_cloudwatch_event_rule.instance_rebalance.name
-  arn  = aws_sqs_queue.karpenter_interruption.arn
-}
-
-resource "aws_cloudwatch_event_rule" "instance_state_change" {
-  name = "${var.project_name}-karpenter-instance-state-change"
-
-  event_pattern = jsonencode({
-    source      = ["aws.ec2"]
-    detail-type = ["EC2 Instance State-change Notification"]
-  })
-
-  tags = {
-    Environment = var.environment
-  }
-}
-
-resource "aws_cloudwatch_event_target" "instance_state_change" {
-  rule = aws_cloudwatch_event_rule.instance_state_change.name
-  arn  = aws_sqs_queue.karpenter_interruption.arn
 }
 
 # --- Karpenter Helm Release ---
@@ -204,11 +106,6 @@ resource "helm_release" "karpenter" {
   set {
     name  = "settings.clusterEndpoint"
     value = var.cluster_endpoint
-  }
-
-  set {
-    name  = "settings.interruptionQueue"
-    value = aws_sqs_queue.karpenter_interruption.name
   }
 
   set {
@@ -243,7 +140,7 @@ resource "kubectl_manifest" "karpenter_node_pool" {
             {
               key      = "karpenter.sh/capacity-type"
               operator = "In"
-              values   = ["spot", "on-demand"]
+              values   = ["on-demand"]
             },
             {
               key      = "node.kubernetes.io/instance-type"
@@ -306,8 +203,8 @@ resource "kubectl_manifest" "karpenter_node_class" {
         }
       }]
       tags = {
-        Environment                                    = var.environment
-        "karpenter.sh/discovery"                       = var.cluster_name
+        Environment              = var.environment
+        "karpenter.sh/discovery" = var.cluster_name
       }
     }
   })
