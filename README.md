@@ -60,14 +60,21 @@ Internet ──> AWS ALB (Ingress) ──> K8s Service ──> Pods (:3000)
 │   └── tests/app.test.js   # Jest unit tests
 ├── Dockerfile              # Multi-stage Docker build
 ├── Jenkinsfile             # CI/CD pipeline (7 stages)
-├── helm/icounter-api/      # Helm chart
-│   ├── templates/          # K8s manifests (deployment, service, ingress, hpa)
-│   ├── values.yaml         # Default values
-│   ├── values-staging.yaml
-│   └── values-production.yaml
+├── helm/
+│   ├── icounter-api/       # Application Helm chart
+│   │   ├── templates/      # K8s manifests (deployment, service, ingress, hpa)
+│   │   ├── values.yaml     # Default values
+│   │   ├── values-staging.yaml
+│   │   └── values-production.yaml
+│   └── karpenter/          # Karpenter Helm chart (wraps official chart + CRDs)
+│       ├── Chart.yaml      # Official karpenter chart as dependency
+│       ├── templates/      # NodePool and EC2NodeClass CRDs
+│       ├── values.yaml     # Default values
+│       ├── values-staging.yaml
+│       └── values-production.yaml
 └── terraform/              # AWS infrastructure
     ├── main.tf             # Module composition
-    └── modules/            # VPC, IAM, EKS, ECR, Karpenter, ALB Controller
+    └── modules/            # VPC, IAM, EKS, ECR, ALB Controller
 ```
 
 ---
@@ -85,7 +92,7 @@ terraform init
 # Preview changes
 terraform plan
 
-# Apply (creates VPC, EKS, ECR, Karpenter, ALB Controller)
+# Apply (creates VPC, EKS, ECR, ALB Controller)
 terraform apply
 ```
 
@@ -95,14 +102,34 @@ terraform apply
 aws eks update-kubeconfig --name icounter-cluster --region ap-south-1
 ```
 
+### Install Karpenter
+
+Karpenter is managed via a dedicated Helm chart (not Terraform) to avoid provider dependency issues:
+
+```bash
+# Authenticate to ECR public
+aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
+
+# Pull the official karpenter subchart dependency
+helm dependency build helm/karpenter/
+
+# Install Karpenter with NodePool and EC2NodeClass
+helm upgrade --install karpenter helm/karpenter/ \
+  -n kube-system \
+  -f helm/karpenter/values-staging.yaml \
+  --set karpenter.settings.clusterEndpoint=<EKS_ENDPOINT> \
+  --set karpenter.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<KARPENTER_CONTROLLER_ROLE_ARN> \
+  --wait
+```
+
 ### Infrastructure Components
 
 | Resource | Details |
 |----------|---------|
 | VPC | 10.0.0.0/16, 2 AZs, single NAT gateway |
-| EKS | v1.29, Fargate profiles for kube-system + karpenter |
+| EKS | v1.29, Fargate profile for kube-system |
 | ECR | `icounter-api` repository with lifecycle policy |
-| Karpenter | On-demand, scale-to-zero, consolidation enabled |
+| Karpenter | Deployed via Helm chart, on-demand, scale-to-zero, consolidation enabled |
 | ALB Controller | Deployed via Helm, IRSA authentication |
 | Metrics Server | Enables HPA pod autoscaling |
 
@@ -122,6 +149,9 @@ aws eks update-kubeconfig --name icounter-cluster --region ap-south-1
 ```bash
 # Remove application first
 helm uninstall icounter-api -n icounter
+
+# Remove Karpenter
+helm uninstall karpenter -n kube-system
 
 # Destroy infrastructure
 cd terraform
@@ -184,7 +214,7 @@ helm upgrade --install icounter-api ./helm/icounter-api \
 - Creates namespace if it doesn't exist
 - Uses environment-specific values file (staging/production)
 - `--wait` ensures pipeline reports success only after pods are healthy
-- Karpenter automatically provisions an on-demand node when pods are scheduled
+- Karpenter (installed separately via Helm) automatically provisions an on-demand node when pods are scheduled
 
 ### Stage 7: Verify Deployment
 ```bash
@@ -342,8 +372,10 @@ HPA monitors pod CPU and memory utilization via the metrics-server. When average
 
 ### Karpenter (Node Autoscaler)
 
-**Instance Selection:**
-- Capacity type: On-demand (stable, no interruptions)
+Karpenter is deployed via a dedicated Helm chart (`helm/karpenter/`) that wraps the official Karpenter OCI chart and includes NodePool and EC2NodeClass CRDs as templates.
+
+**Instance Selection (configurable via values files):**
+- Capacity type: On-demand for staging, Spot + On-demand for production
 - Instance types: t3.small, t3.medium, t3a.small, t3a.medium, m5.large, m5a.large
 - Karpenter picks the most cost-effective instance type that fits the pending pod requirements
 
@@ -353,9 +385,9 @@ When all application pods are removed (e.g., `helm uninstall`), Karpenter termin
 **Consolidation:**
 Karpenter continuously monitors node utilization. If pods can be packed onto fewer nodes, it cordons the underutilized node, reschedules pods, and terminates it. This keeps compute costs minimal.
 
-**Safety Limits:**
-- Max 10 CPU cores across all Karpenter-managed nodes
-- Max 40Gi memory across all Karpenter-managed nodes
+**Safety Limits (staging / production):**
+- Max CPU: 10 / 100 cores across all Karpenter-managed nodes
+- Max memory: 40Gi / 400Gi across all Karpenter-managed nodes
 - Node expiry: 30 days (forces rotation for security patching)
 
 ---
