@@ -1,0 +1,13 @@
+clusterName: "icounter-cluster"
+region: "ap-south-1"
+vpcId: ""  # Set at install time: --set vpcId=<VPC_ID>
+
+aws-load-balancer-controller:
+  clusterName: "icounter-cluster"
+  region: "ap-south-1"
+  vpcId: ""  # Set at install time: --set aws-load-balancer-controller.vpcId=<VPC_ID>
+  serviceAccount:
+    create: true
+    name: aws-load-balancer-controller
+    annotations:
+      eks.amazonaws.com/role-arn: ""  # Set at install time

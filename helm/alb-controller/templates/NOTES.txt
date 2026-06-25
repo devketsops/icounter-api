@@ -1,0 +1,10 @@
+AWS Load Balancer Controller has been deployed successfully!
+
+To verify the controller is running:
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name=aws-load-balancer-controller
+
+To check ingress resources:
+  kubectl get ingress --all-namespaces
+
+To view controller logs:
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name=aws-load-balancer-controller -f

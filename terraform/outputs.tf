@@ -18,6 +18,16 @@ output "vpc_id" {
   value       = module.vpc.vpc_id
 }
 
+output "alb_controller_role_arn" {
+  description = "ALB controller IAM role ARN (pass to Helm install)"
+  value       = module.alb_controller.alb_controller_role_arn
+}
+
+output "karpenter_controller_role_arn" {
+  description = "Karpenter controller IAM role ARN (pass to Helm install)"
+  value       = module.karpenter_iam.karpenter_controller_role_arn
+}
+
 output "kubeconfig_command" {
   description = "Command to configure kubectl"
   value       = "aws eks update-kubeconfig --name ${module.eks.cluster_name} --region ${var.aws_region}"

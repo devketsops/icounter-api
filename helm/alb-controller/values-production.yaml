@@ -1,0 +1,4 @@
+aws-load-balancer-controller:
+  clusterName: "icounter-cluster"
+  region: "ap-south-1"
+  replicaCount: 2

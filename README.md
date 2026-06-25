@@ -66,15 +66,19 @@ Internet ──> AWS ALB (Ingress) ──> K8s Service ──> Pods (:3000)
 │   │   ├── values.yaml     # Default values
 │   │   ├── values-staging.yaml
 │   │   └── values-production.yaml
+│   ├── alb-controller/     # ALB Controller Helm chart (wraps official chart)
+│   │   ├── Chart.yaml      # Official aws-load-balancer-controller as dependency
+│   │   └── values.yaml     # Cluster name, IRSA annotation, region, VPC
+│   ├── metrics-server/     # Metrics Server Helm chart (required for HPA)
+│   │   ├── Chart.yaml      # Official metrics-server as dependency
+│   │   └── values.yaml     # kubelet-insecure-tls config
 │   └── karpenter/          # Karpenter Helm chart (wraps official chart + CRDs)
 │       ├── Chart.yaml      # Official karpenter chart as dependency
 │       ├── templates/      # NodePool and EC2NodeClass CRDs
-│       ├── values.yaml     # Default values
-│       ├── values-staging.yaml
-│       └── values-production.yaml
-└── terraform/              # AWS infrastructure
+│       └── values.yaml     # Default values
+└── terraform/              # AWS infrastructure (pure AWS resources, no Helm/K8s)
     ├── main.tf             # Module composition
-    └── modules/            # VPC, IAM, EKS, ECR, ALB Controller
+    └── modules/            # VPC, IAM, EKS, ECR, ALB IAM, Karpenter IAM
 ```
 
 ---
@@ -92,7 +96,7 @@ terraform init
 # Preview changes
 terraform plan
 
-# Apply (creates VPC, EKS, ECR, ALB Controller)
+# Apply (single stage — creates VPC, EKS, ECR, IAM roles)
 terraform apply
 ```
 
@@ -102,23 +106,38 @@ terraform apply
 aws eks update-kubeconfig --name icounter-cluster --region ap-south-1
 ```
 
-### Install Karpenter
+### Install Cluster Components (Helm)
 
-Karpenter is managed via a dedicated Helm chart (not Terraform) to avoid provider dependency issues:
+After Terraform creates the AWS infrastructure, install the Kubernetes components via Helm:
 
 ```bash
-# Authenticate to ECR public
-aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
+# Get values from Terraform output
+EKS_ENDPOINT=$(terraform output -raw eks_cluster_endpoint)
+VPC_ID=$(terraform output -raw vpc_id)
+ALB_ROLE_ARN=$(terraform output -raw alb_controller_role_arn)
+KARPENTER_ROLE_ARN=$(terraform output -raw karpenter_controller_role_arn)
 
-# Pull the official karpenter subchart dependency
-helm dependency build helm/karpenter/
+# 1. Install Metrics Server (required for HPA)
+helm dependency build ../helm/metrics-server/
+helm upgrade --install metrics-server ../helm/metrics-server/ -n kube-system --wait
 
-# Install Karpenter with NodePool and EC2NodeClass
-helm upgrade --install karpenter helm/karpenter/ \
+# 2. Install ALB Controller
+helm dependency build ../helm/alb-controller/
+helm upgrade --install alb-controller ../helm/alb-controller/ \
   -n kube-system \
-  -f helm/karpenter/values-staging.yaml \
-  --set karpenter.settings.clusterEndpoint=<EKS_ENDPOINT> \
-  --set karpenter.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<KARPENTER_CONTROLLER_ROLE_ARN> \
+  -f ../helm/alb-controller/values-staging.yaml \
+  --set "aws-load-balancer-controller.vpcId=$VPC_ID" \
+  --set "aws-load-balancer-controller.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$ALB_ROLE_ARN" \
+  --wait
+
+# 3. Install Karpenter
+aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
+helm dependency build ../helm/karpenter/
+helm upgrade --install karpenter ../helm/karpenter/ \
+  -n kube-system \
+  -f ../helm/karpenter/values-staging.yaml \
+  --set karpenter.settings.clusterEndpoint=$EKS_ENDPOINT \
+  --set "karpenter.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$KARPENTER_ROLE_ARN" \
   --wait
 ```
 
@@ -129,9 +148,9 @@ helm upgrade --install karpenter helm/karpenter/ \
 | VPC | 10.0.0.0/16, 2 AZs, single NAT gateway |
 | EKS | v1.29, Fargate profile for kube-system |
 | ECR | `icounter-api` repository with lifecycle policy |
-| Karpenter | Deployed via Helm chart, on-demand, scale-to-zero, consolidation enabled |
-| ALB Controller | Deployed via Helm, IRSA authentication |
-| Metrics Server | Enables HPA pod autoscaling |
+| Karpenter IAM | Controller IRSA role + node role (Terraform), controller + CRDs (Helm) |
+| ALB Controller IAM | IRSA role (Terraform), controller deployment (Helm) |
+| Metrics Server | Deployed via Helm, enables HPA pod autoscaling |
 
 ### Cost Estimate
 
@@ -150,8 +169,10 @@ helm upgrade --install karpenter helm/karpenter/ \
 # Remove application first
 helm uninstall icounter-api -n icounter
 
-# Remove Karpenter
+# Remove cluster components
 helm uninstall karpenter -n kube-system
+helm uninstall alb-controller -n kube-system
+helm uninstall metrics-server -n kube-system
 
 # Destroy infrastructure
 cd terraform
