@@ -1,14 +1,10 @@
-locals {
-  cluster_name = "${var.project_name}-cluster"
-}
-
 resource "aws_eks_cluster" "main" {
   name     = local.cluster_name
-  version  = var.cluster_version
-  role_arn = var.cluster_role_arn
+  version  = var.eks_cluster_version
+  role_arn = aws_iam_role.eks_cluster.arn
 
   vpc_config {
-    subnet_ids              = concat(var.private_subnet_ids, var.public_subnet_ids)
+    subnet_ids              = concat(aws_subnet.private[*].id, aws_subnet.public[*].id)
     endpoint_private_access = true
     endpoint_public_access  = true
   }
@@ -26,7 +22,7 @@ resource "aws_eks_cluster" "main" {
 # Allow Karpenter nodes to join the cluster
 resource "aws_eks_access_entry" "karpenter_node" {
   cluster_name  = aws_eks_cluster.main.name
-  principal_arn = var.karpenter_node_role_arn
+  principal_arn = aws_iam_role.karpenter_node.arn
   type          = "EC2_LINUX"
 }
 
@@ -34,8 +30,8 @@ resource "aws_eks_access_entry" "karpenter_node" {
 resource "aws_eks_fargate_profile" "kube_system" {
   cluster_name           = aws_eks_cluster.main.name
   fargate_profile_name   = "${var.project_name}-kube-system"
-  pod_execution_role_arn = var.fargate_pod_execution_role_arn
-  subnet_ids             = var.private_subnet_ids
+  pod_execution_role_arn = aws_iam_role.fargate_pod_execution.arn
+  subnet_ids             = aws_subnet.private[*].id
 
   selector {
     namespace = "kube-system"

@@ -77,8 +77,14 @@ Internet ──> AWS ALB (Ingress) ──> K8s Service ──> Pods (:3000)
 │       ├── templates/      # NodePool and EC2NodeClass CRDs
 │       └── values.yaml     # Default values
 └── terraform/              # AWS infrastructure (pure AWS resources, no Helm/K8s)
-    ├── main.tf             # Module composition
-    └── modules/            # VPC, IAM, EKS, ECR, ALB IAM, Karpenter IAM
+    ├── vpc.tf              # VPC, subnets, NAT, route tables
+    ├── iam.tf              # All IAM roles (EKS, Fargate, Karpenter, ALB)
+    ├── eks.tf              # EKS cluster, Fargate profile, add-ons, OIDC
+    ├── ecr.tf              # ECR repository + lifecycle policy
+    ├── providers.tf        # AWS and TLS providers
+    ├── variables.tf        # Input variables
+    ├── outputs.tf          # Terraform outputs
+    └── terraform.tfvars    # Variable values
 ```
 
 ---
