@@ -1,0 +1,17 @@
+{
+  "name": "icounter-api",
+  "version": "1.0.0",
+  "description": "iCOUNTER API for DevOps assignment",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "jest --coverage --forceExit"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.4"
+  }
+}

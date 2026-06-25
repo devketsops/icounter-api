@@ -1,0 +1,17 @@
+replicaCount: 3
+
+config:
+  NODE_ENV: production
+  LOG_LEVEL: warn
+
+autoscaling:
+  minReplicas: 3
+  maxReplicas: 10
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

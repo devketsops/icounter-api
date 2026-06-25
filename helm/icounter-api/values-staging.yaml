@@ -1,0 +1,17 @@
+replicaCount: 2
+
+config:
+  NODE_ENV: staging
+  LOG_LEVEL: debug
+
+autoscaling:
+  minReplicas: 2
+  maxReplicas: 4
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi

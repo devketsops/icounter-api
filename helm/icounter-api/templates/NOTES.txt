@@ -1,0 +1,14 @@
+iCOUNTER API has been deployed successfully!
+
+To get the ALB endpoint:
+  kubectl get ingress {{ include "icounter-api.fullname" . }} -n {{ .Release.Namespace }}
+
+To check pod status:
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "icounter-api.name" . }}
+
+To check HPA status:
+  kubectl get hpa {{ include "icounter-api.fullname" . }} -n {{ .Release.Namespace }}
+
+To test the health endpoint:
+  ALB_DNS=$(kubectl get ingress {{ include "icounter-api.fullname" . }} -n {{ .Release.Namespace }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+  curl http://$ALB_DNS/health
