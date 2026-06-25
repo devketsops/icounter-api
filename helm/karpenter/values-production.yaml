@@ -1,0 +1,24 @@
+environment: "production"
+
+karpenter:
+  replicas: 2
+
+nodePool:
+  requirements:
+    capacityType:
+      - spot
+      - on-demand
+    instanceTypes:
+      - t3.medium
+      - t3a.medium
+      - m5.large
+      - m5a.large
+      - m5.xlarge
+      - m5a.xlarge
+  limits:
+    cpu: "100"
+    memory: "400Gi"
+
+nodeClass:
+  blockDevice:
+    volumeSize: "50Gi"

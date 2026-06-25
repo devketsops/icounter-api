@@ -23,13 +23,6 @@ resource "aws_eks_cluster" "main" {
   }
 }
 
-# Allow Karpenter nodes to join the cluster
-resource "aws_eks_access_entry" "karpenter_node" {
-  cluster_name  = aws_eks_cluster.main.name
-  principal_arn = var.karpenter_node_role_arn
-  type          = "EC2_LINUX"
-}
-
 # Fargate profile for system components (kube-system namespace)
 resource "aws_eks_fargate_profile" "kube_system" {
   cluster_name           = aws_eks_cluster.main.name
@@ -39,22 +32,6 @@ resource "aws_eks_fargate_profile" "kube_system" {
 
   selector {
     namespace = "kube-system"
-  }
-
-  tags = {
-    Environment = var.environment
-  }
-}
-
-# Fargate profile for karpenter namespace
-resource "aws_eks_fargate_profile" "karpenter" {
-  cluster_name           = aws_eks_cluster.main.name
-  fargate_profile_name   = "${var.project_name}-karpenter"
-  pod_execution_role_arn = var.fargate_pod_execution_role_arn
-  subnet_ids             = var.private_subnet_ids
-
-  selector {
-    namespace = "karpenter"
   }
 
   tags = {
@@ -102,11 +79,4 @@ resource "aws_iam_openid_connect_provider" "eks" {
     Name        = "${var.project_name}-eks-oidc"
     Environment = var.environment
   }
-}
-
-# Tag cluster security group for Karpenter discovery
-resource "aws_ec2_tag" "cluster_sg_karpenter" {
-  resource_id = aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
-  key         = "karpenter.sh/discovery"
-  value       = local.cluster_name
 }

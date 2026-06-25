@@ -1,0 +1,25 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: {{ .Values.nodeClass.name }}
+  labels:
+    {{- include "karpenter.labels" . | nindent 4 }}
+spec:
+  role: {{ .Values.nodeClass.role | quote }}
+  amiSelectorTerms:
+    - alias: {{ .Values.nodeClass.amiFamily }}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ .Values.clusterName | quote }}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ .Values.clusterName | quote }}
+  blockDeviceMappings:
+    - deviceName: {{ .Values.nodeClass.blockDevice.deviceName }}
+      ebs:
+        volumeSize: {{ .Values.nodeClass.blockDevice.volumeSize | quote }}
+        volumeType: {{ .Values.nodeClass.blockDevice.volumeType }}
+        encrypted: {{ .Values.nodeClass.blockDevice.encrypted }}
+  tags:
+    Environment: {{ .Values.environment | quote }}
+    karpenter.sh/discovery: {{ .Values.clusterName | quote }}

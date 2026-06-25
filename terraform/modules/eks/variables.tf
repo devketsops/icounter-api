@@ -23,11 +23,6 @@ variable "fargate_pod_execution_role_arn" {
   type        = string
 }
 
-variable "karpenter_node_role_arn" {
-  description = "Karpenter node IAM role ARN"
-  type        = string
-}
-
 variable "private_subnet_ids" {
   description = "Private subnet IDs"
   type        = list(string)

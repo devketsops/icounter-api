@@ -1,0 +1,46 @@
+clusterName: "icounter-cluster"
+environment: "staging"
+
+# --- Karpenter Controller (subchart values) ---
+karpenter:
+  settings:
+    clusterName: "icounter-cluster"
+    clusterEndpoint: ""  # Set at install time: --set karpenter.settings.clusterEndpoint=<EKS_ENDPOINT>
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: ""  # Set at install time: --set karpenter.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<ROLE_ARN>
+  replicas: 1
+
+# --- EC2NodeClass ---
+nodeClass:
+  name: default
+  role: "icounter-karpenter-node-role"
+  amiFamily: "al2023@latest"
+  blockDevice:
+    deviceName: "/dev/xvda"
+    volumeSize: "20Gi"
+    volumeType: "gp3"
+    encrypted: true
+
+# --- NodePool ---
+nodePool:
+  name: default
+  requirements:
+    arch:
+      - amd64
+    capacityType:
+      - on-demand
+    instanceTypes:
+      - t3.small
+      - t3.medium
+      - t3a.small
+      - t3a.medium
+      - m5.large
+      - m5a.large
+  limits:
+    cpu: "10"
+    memory: "40Gi"
+  expireAfter: "720h"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: "30s"

@@ -1,0 +1,21 @@
+environment: "staging"
+
+karpenter:
+  replicas: 1
+
+nodePool:
+  requirements:
+    capacityType:
+      - on-demand
+    instanceTypes:
+      - t3.small
+      - t3.medium
+      - t3a.small
+      - t3a.medium
+  limits:
+    cpu: "10"
+    memory: "40Gi"
+
+nodeClass:
+  blockDevice:
+    volumeSize: "20Gi"
