@@ -401,21 +401,74 @@ HPA monitors pod CPU and memory utilization via the metrics-server. When average
 
 Karpenter is deployed via a dedicated Helm chart (`helm/karpenter/`) that wraps the official Karpenter OCI chart and includes NodePool and EC2NodeClass CRDs as templates.
 
-**Instance Selection (configurable via values files):**
-- Capacity type: On-demand for staging, Spot + On-demand for production
-- Instance types: t3.small, t3.medium, t3a.small, t3a.medium, m5.large, m5a.large
-- Karpenter picks the most cost-effective instance type that fits the pending pod requirements
+#### EC2NodeClass Configuration
+
+The EC2NodeClass defines what kind of EC2 instances Karpenter can launch:
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| Role | `icounter-karpenter-node-role` | IAM role attached to launched EC2 nodes (EKS worker, CNI, ECR, SSM permissions) |
+| AMI Family | `al2023@latest` | Uses the latest Amazon Linux 2023 EKS-optimized AMI automatically |
+| Subnet Discovery | Tag `karpenter.sh/discovery: icounter-cluster` | Launches nodes only in private subnets tagged for Karpenter |
+| Security Group Discovery | Tag `karpenter.sh/discovery: icounter-cluster` | Uses the EKS cluster security group tagged in Terraform |
+| Block Device | `/dev/xvda`, 20Gi (staging) / 50Gi (production), gp3, encrypted | Encrypted root volume for each node |
+
+#### NodePool Configuration
+
+The NodePool defines when, how many, and which nodes Karpenter provisions:
+
+**Instance Requirements:**
+
+| Constraint | Value | Purpose |
+|-----------|-------|---------|
+| Architecture | `amd64` | Only x86_64 instances (matches Docker image platform) |
+| Capacity Type | `on-demand` (staging), `spot + on-demand` (production) | Cost optimization strategy per environment |
+| Instance Types | `t3.small`, `t3.medium`, `t3a.small`, `t3a.medium`, `m5.large`, `m5a.large` | Karpenter picks the cheapest type that fits pending pod resource requests |
+
+**Safety Limits (staging / production):**
+
+| Limit | Staging | Production | Purpose |
+|-------|---------|------------|---------|
+| Max CPU | 10 cores | 100 cores | Total CPU across all Karpenter-managed nodes |
+| Max Memory | 40Gi | 400Gi | Total memory across all Karpenter-managed nodes |
+
+**Disruption & Lifecycle:**
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| Consolidation Policy | `WhenEmptyOrUnderutilized` | Removes nodes when empty or when pods can fit on fewer nodes |
+| Consolidate After | `30s` | Aggressive cleanup for cost savings |
+| Expire After | `720h` (30 days) | Forces node rotation for fresh AMIs and security patches |
+
+#### Provisioning Flow
+
+```
+Pending pod (needs 100m CPU, 128Mi memory)
+    │
+    ▼
+Karpenter detects the pending pod
+    │
+    ▼
+NodePool: amd64, on-demand, pick from t3/t3a/m5 family
+    │
+    ▼
+EC2NodeClass: use IAM role, private subnets, cluster SG, 20Gi disk
+    │
+    ▼
+Karpenter picks cheapest fit (e.g. t3a.small at ~$0.0188/hr)
+    │
+    ▼
+Node launches → pod schedules → app runs
+    │
+    ▼
+All pods removed? → 30s later → node terminated (scale to zero)
+```
 
 **Scale-to-Zero:**
 When all application pods are removed (e.g., `helm uninstall`), Karpenter terminates all nodes within 30 seconds. System pods continue running on Fargate (no EC2 cost).
 
 **Consolidation:**
 Karpenter continuously monitors node utilization. If pods can be packed onto fewer nodes, it cordons the underutilized node, reschedules pods, and terminates it. This keeps compute costs minimal.
-
-**Safety Limits (staging / production):**
-- Max CPU: 10 / 100 cores across all Karpenter-managed nodes
-- Max memory: 40Gi / 400Gi across all Karpenter-managed nodes
-- Node expiry: 30 days (forces rotation for security patching)
 
 ---
 
