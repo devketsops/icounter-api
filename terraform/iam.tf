@@ -148,6 +148,7 @@ resource "aws_iam_role_policy" "karpenter_controller" {
           "ec2:DescribeLaunchTemplates",
           "ec2:DescribeSecurityGroups",
           "ec2:DescribeSubnets",
+          "ec2:DescribeSpotPriceHistory",
           "ec2:RunInstances",
           "ec2:TerminateInstances",
         ]
@@ -158,6 +159,20 @@ resource "aws_iam_role_policy" "karpenter_controller" {
         Effect   = "Allow"
         Action   = "iam:PassRole"
         Resource = aws_iam_role.karpenter_node.arn
+      },
+      {
+        Sid    = "InstanceProfile"
+        Effect = "Allow"
+        Action = [
+          "iam:CreateInstanceProfile",
+          "iam:DeleteInstanceProfile",
+          "iam:GetInstanceProfile",
+          "iam:AddRoleToInstanceProfile",
+          "iam:RemoveRoleFromInstanceProfile",
+          "iam:TagInstanceProfile",
+          "iam:ListInstanceProfiles",
+        ]
+        Resource = "*"
       },
       {
         Sid    = "EKSAccess"

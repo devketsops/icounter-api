@@ -46,7 +46,7 @@ pipeline {
         stage('Docker Build') {
             steps {
                 sh """
-                    docker build \
+                    docker build --platform linux/amd64 \
                         -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
                         -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest \
                         .
