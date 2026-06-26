@@ -78,7 +78,7 @@ pipeline {
                             -f ${valuesFile} \
                             --set image.repository=${ECR_REGISTRY}/${ECR_REPOSITORY} \
                             --set image.tag=${IMAGE_TAG} \
-                            --set config.APP_VERSION=${IMAGE_TAG} \
+                            --set config.appVersion=${IMAGE_TAG} \
                             --wait \
                             --timeout 300s \
                             ${dryRunFlag}

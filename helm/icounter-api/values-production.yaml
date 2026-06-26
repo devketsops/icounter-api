@@ -1,8 +1,9 @@
+environment: production
 replicaCount: 3
 
 config:
-  NODE_ENV: production
-  LOG_LEVEL: warn
+  nodeEnv: production
+  logLevel: warn
 
 autoscaling:
   minReplicas: 3

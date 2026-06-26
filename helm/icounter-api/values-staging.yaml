@@ -1,8 +1,9 @@
+environment: staging
 replicaCount: 2
 
 config:
-  NODE_ENV: staging
-  LOG_LEVEL: debug
+  nodeEnv: staging
+  logLevel: debug
 
 autoscaling:
   minReplicas: 2
