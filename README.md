@@ -34,7 +34,7 @@ Internet ──> AWS ALB (Ingress) ──> K8s Service ──> Pods (:3000)
 | Container | Docker (multi-stage build) |
 | CI/CD | Jenkins (Declarative Pipeline) |
 | Container Registry | AWS ECR |
-| Kubernetes | Amazon EKS (v1.29) |
+| Kubernetes | Amazon EKS (v1.35) |
 | Node Provisioning | Karpenter (on-demand) |
 | System Pods | AWS Fargate |
 | Load Balancer | AWS ALB (via AWS Load Balancer Controller) |
@@ -152,7 +152,7 @@ helm upgrade --install karpenter ../helm/karpenter/ \
 | Resource | Details |
 |----------|---------|
 | VPC | 10.0.0.0/16, 2 AZs, single NAT gateway |
-| EKS | v1.29, Fargate profile for kube-system |
+| EKS | v1.35, Fargate profile for kube-system |
 | ECR | `icounter-api` repository with lifecycle policy |
 | Karpenter IAM | Controller IRSA role + node role (Terraform), controller + CRDs (Helm) |
 | ALB Controller IAM | IRSA role (Terraform), controller deployment (Helm) |
@@ -315,7 +315,7 @@ kubectl rollout undo deployment/icounter-api -n icounter
 - Jenkins authenticates via `aws ecr get-login-password`
 
 ### EKS (Elastic Kubernetes Service)
-- Managed Kubernetes v1.29 cluster
+- Managed Kubernetes v1.35 cluster
 - Fargate profiles for system components (no EC2 nodes needed for cluster operations)
 - OIDC provider for IRSA (IAM Roles for Service Accounts)
 - EKS add-ons: vpc-cni, kube-proxy, CoreDNS (Fargate-compatible)
