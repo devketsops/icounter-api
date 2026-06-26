@@ -158,6 +158,144 @@ helm upgrade --install karpenter ../helm/karpenter/ \
 | ALB Controller IAM | IRSA role (Terraform), controller deployment (Helm) |
 | Metrics Server | Deployed via Helm, enables HPA pod autoscaling |
 
+### Terraform Code Breakdown
+
+#### `providers.tf` — Provider Configuration
+
+- **AWS Provider (~> 5.0)** — creates all AWS resources, configured for `ap-south-1` (Mumbai)
+- **TLS Provider (~> 4.0)** — fetches the EKS OIDC certificate thumbprint needed for IRSA (IAM Roles for Service Accounts)
+
+#### `variables.tf` + `terraform.tfvars` — Input Variables
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `aws_region` | `ap-south-1` | AWS region for all resources |
+| `project_name` | `icounter` | Prefix for all resource names (e.g. `icounter-cluster`, `icounter-vpc`) |
+| `environment` | `staging` | Tag for environment identification |
+| `vpc_cidr` | `10.0.0.0/16` | VPC address space — 65,536 IP addresses |
+| `eks_cluster_version` | `1.35` | Kubernetes version for EKS |
+
+`variables.tf` declares inputs with defaults. `terraform.tfvars` overrides them — lets you change environments without touching the code.
+
+#### `vpc.tf` — Networking
+
+```
+VPC (10.0.0.0/16)
+├── Public Subnets (internet-facing)
+│   ├── 10.0.1.0/24 in AZ-1 (ap-south-1a)
+│   └── 10.0.2.0/24 in AZ-2 (ap-south-1b)
+│
+├── Private Subnets (internal)
+│   ├── 10.0.10.0/24 in AZ-1
+│   └── 10.0.11.0/24 in AZ-2
+│
+├── Internet Gateway ──> Public subnets (direct internet)
+├── NAT Gateway ──> Private subnets (outbound-only internet)
+│   └── Elastic IP (static public IP for NAT)
+│
+├── Public Route Table:  0.0.0.0/0 → Internet Gateway
+└── Private Route Table: 0.0.0.0/0 → NAT Gateway
+```
+
+- AZs are dynamically fetched via `data "aws_availability_zones"`, picking the first 2
+- Subnets are auto-carved from the VPC CIDR using `cidrsubnet()`
+- **Public subnets** are tagged with `kubernetes.io/role/elb: "1"` for ALB auto-discovery
+- **Private subnets** are tagged with `karpenter.sh/discovery` for Karpenter node placement and `kubernetes.io/role/internal-elb: "1"` for internal load balancers
+- Single NAT Gateway keeps cost low for staging (production would use one per AZ)
+
+#### `eks.tf` — EKS Cluster & Add-ons
+
+```
+EKS Cluster (icounter-cluster, v1.35)
+├── VPC Config: all 4 subnets, public + private endpoint access
+├── Auth: API_AND_CONFIG_MAP mode
+│
+├── Access Entries
+│   ├── Karpenter node role (EC2_LINUX) — lets nodes join the cluster
+│   └── Admin (Terraform IAM user) — cluster admin access
+│
+├── Fargate Profile (kube-system namespace)
+│   └── System pods run serverlessly on Fargate
+│
+├── EKS Add-ons
+│   ├── vpc-cni — pod networking (assigns VPC IPs to pods)
+│   ├── kube-proxy — in-cluster service routing
+│   └── coredns — DNS resolution (Fargate-compatible)
+│
+├── OIDC Provider — enables IRSA
+│   └── Registers EKS OIDC endpoint with IAM
+│
+└── Cluster SG Tag — karpenter.sh/discovery for Karpenter
+```
+
+- Both private and public API endpoint access enabled (reachable from VPC and your laptop)
+- OIDC provider is the foundation for IRSA — lets K8s service accounts assume IAM roles
+- Fargate profile targets `kube-system` namespace so system pods need no EC2 nodes
+
+#### `iam.tf` — IAM Roles & Policies
+
+```
+IAM Roles
+├── EKS Cluster Role
+│   └── Trust: eks.amazonaws.com → AmazonEKSClusterPolicy
+│
+├── Fargate Pod Execution Role
+│   └── Trust: eks-fargate-pods.amazonaws.com → AmazonEKSFargatePodExecutionRolePolicy
+│
+├── Karpenter Node Role (attached to launched EC2 instances)
+│   ├── Trust: ec2.amazonaws.com
+│   ├── AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy
+│   ├── AmazonEC2ContainerRegistryReadOnly, AmazonSSMManagedInstanceCore
+│   └── Instance Profile (required for EC2 launch)
+│
+├── Karpenter Controller Role (IRSA — used by the Karpenter pod)
+│   ├── Trust: OIDC federation (only kube-system:karpenter SA)
+│   └── EC2 fleet management, IAM instance profiles, EKS, SSM, Pricing API
+│
+└── ALB Controller Role (IRSA — used by the ALB controller pod)
+    ├── Trust: OIDC federation (only kube-system:aws-load-balancer-controller SA)
+    └── ELB, EC2 security groups, ACM certificates, WAF/Shield
+```
+
+- **IRSA** restricts AWS permissions to specific K8s service accounts via OIDC conditions — only the designated pod gets AWS access, not every pod in the cluster
+- **Karpenter has two roles:** the controller role (to launch/terminate instances) and the node role (for launched instances to join the cluster and pull images)
+
+#### `ecr.tf` — Container Registry
+
+- Repository `icounter-api` with mutable tags (allows overwriting `:latest`)
+- Vulnerability scanning enabled on every push
+- Lifecycle policy auto-deletes untagged images beyond the last 10, preventing storage cost creep
+
+#### `outputs.tf` — Exported Values
+
+| Output | Consumed By |
+|--------|-------------|
+| `eks_cluster_endpoint` | Karpenter Helm install (`--set karpenter.settings.clusterEndpoint`) |
+| `eks_cluster_name` | kubectl config / reference |
+| `ecr_repository_url` | Docker push + Helm deploy (`--set image.repository`) |
+| `vpc_id` | ALB Controller Helm install (`--set vpcId`) |
+| `alb_controller_role_arn` | ALB Controller service account IRSA annotation |
+| `karpenter_controller_role_arn` | Karpenter service account IRSA annotation |
+| `kubeconfig_command` | Convenience command to configure kubectl |
+
+#### How Terraform Files Connect
+
+```
+terraform.tfvars (inputs)
+    │
+    ▼
+vpc.tf ─────────────> eks.tf ──────────────> iam.tf
+(network foundation)  (cluster + OIDC)       (roles + policies)
+    │                     │                       │
+    │                     │                       ▼
+    │                     │                  IRSA binds K8s SAs
+    │                     │                  to IAM roles via OIDC
+    │                     │
+    ▼                     ▼
+ecr.tf               outputs.tf ──> Helm installs use these values
+(image storage)
+```
+
 ### Cost Estimate
 
 | Component | Monthly Cost |
