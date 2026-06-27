@@ -162,22 +162,36 @@ helm upgrade --install karpenter ../helm/karpenter/ \
 
 #### `providers.tf` — Provider Configuration
 
-- **AWS Provider (~> 5.0)** — creates all AWS resources, configured for `ap-south-1` (Mumbai)
-- **TLS Provider (~> 4.0)** — fetches the EKS OIDC certificate thumbprint needed for IRSA (IAM Roles for Service Accounts)
+- **AWS Provider (~> 5.0)** — the only provider needed. Creates all AWS resources, configured for `ap-south-1` (Mumbai)
+- AWS handles EKS OIDC certificate verification internally using its trusted CA library, so no TLS provider is needed
 
 #### `variables.tf` + `terraform.tfvars` — Input Variables
 
-| Variable | Value | Purpose |
-|----------|-------|---------|
-| `aws_region` | `ap-south-1` | AWS region for all resources |
-| `project_name` | `icounter` | Prefix for all resource names (e.g. `icounter-cluster`, `icounter-vpc`) |
+`variables.tf` declares inputs with defaults. `terraform.tfvars` overrides them — lets you change environments without touching the code.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `aws_region` | `ap-south-1` | Which AWS datacenter region to use |
+| `project_name` | `icounter` | Prefix added to every resource name (e.g. `icounter-cluster`, `icounter-vpc`) |
 | `environment` | `staging` | Tag for environment identification |
 | `vpc_cidr` | `10.0.0.0/16` | VPC address space — 65,536 IP addresses |
 | `eks_cluster_version` | `1.35` | Kubernetes version for EKS |
+| `core_node_instance_types` | `["t3.medium"]` | EC2 instance size for core infrastructure nodes (2 vCPU, 4 GB RAM) |
+| `core_node_desired_size` | `2` | How many core nodes to run normally |
+| `core_node_min_size` | `2` | Never go below this many core nodes |
+| `core_node_max_size` | `3` | Never exceed this many core nodes |
 
-`variables.tf` declares inputs with defaults. `terraform.tfvars` overrides them — lets you change environments without touching the code.
+#### `backend.tf` — State Storage
+
+Currently commented out, so Terraform saves its state as a local file on your machine (`terraform.tfstate`). The commented block shows the production-ready setup:
+
+- **S3 bucket** — stores state remotely so a team can share it
+- **DynamoDB table** — prevents two people from running `terraform apply` at the same time (state locking)
+- **encrypt = true** — state contains sensitive info (ARNs, endpoints), so encrypt it at rest
 
 #### `vpc.tf` — Networking
+
+Everything runs inside this network. Think of it as building roads, highways, and walls before putting buildings on them.
 
 ```
 VPC (10.0.0.0/16)
@@ -185,57 +199,83 @@ VPC (10.0.0.0/16)
 │   ├── 10.0.1.0/24 in AZ-1 (ap-south-1a)
 │   └── 10.0.2.0/24 in AZ-2 (ap-south-1b)
 │
-├── Private Subnets (internal)
+├── Private Subnets (internal, no public IPs)
 │   ├── 10.0.10.0/24 in AZ-1
 │   └── 10.0.11.0/24 in AZ-2
 │
-├── Internet Gateway ──> Public subnets (direct internet)
-├── NAT Gateway ──> Private subnets (outbound-only internet)
+├── Internet Gateway ──> Public subnets (direct internet access)
+├── NAT Gateway ──> Private subnets (outbound-only, like a one-way door)
 │   └── Elastic IP (static public IP for NAT)
 │
 ├── Public Route Table:  0.0.0.0/0 → Internet Gateway
 └── Private Route Table: 0.0.0.0/0 → NAT Gateway
 ```
 
-- AZs are dynamically fetched via `data "aws_availability_zones"`, picking the first 2
-- Subnets are auto-carved from the VPC CIDR using `cidrsubnet()`
-- **Public subnets** are tagged with `kubernetes.io/role/elb: "1"` for ALB auto-discovery
-- **Private subnets** are tagged with `karpenter.sh/discovery` for Karpenter node placement and `kubernetes.io/role/internal-elb: "1"` for internal load balancers
+**Resource-by-resource:**
+
+| Resource | What it does in simple words |
+|----------|-----|
+| `data "aws_availability_zones"` | Asks AWS "which datacenters are available?" then picks the first 2 for high availability |
+| `aws_vpc.main` | Creates the isolated network. DNS is enabled so pods can resolve hostnames |
+| `aws_subnet.public[0..1]` | Two public subnets with auto-assigned public IPs. The `kubernetes.io/role/elb` tag tells the ALB controller "put internet-facing load balancers here" |
+| `aws_subnet.private[0..1]` | Two private subnets — hidden from the internet. The `karpenter.sh/discovery` tag lets Karpenter find these subnets when launching worker nodes. The `kubernetes.io/role/internal-elb` tag is for internal load balancers |
+| `aws_internet_gateway.main` | The door between your VPC and the internet — without it, nothing can reach the outside world |
+| `aws_eip.nat` | A fixed public IP address that gets attached to the NAT Gateway |
+| `aws_nat_gateway.main` | Sits in the first public subnet. Lets private-subnet resources (pods, nodes) reach the internet to pull images and call APIs, but the internet cannot reach them directly |
+| `aws_route_table.public` | Routing rule: "Any traffic going outside the VPC goes through the Internet Gateway" |
+| `aws_route_table.private` | Routing rule: "Any outbound traffic goes through the NAT Gateway" |
+| `aws_route_table_association.public/private` | Links each subnet to its route table — without these, the subnets wouldn't know which routing rules to follow |
+
+- Subnets are auto-carved from the VPC CIDR using `cidrsubnet()` function
 - Single NAT Gateway keeps cost low for staging (production would use one per AZ)
 
-#### `eks.tf` — EKS Cluster & Add-ons
+#### `eks.tf` — EKS Cluster, Core Nodes & Add-ons
 
 ```
 EKS Cluster (icounter-cluster, v1.35)
 ├── VPC Config: all 4 subnets, public + private endpoint access
-├── Auth: API mode
+├── Auth: API mode (access managed entirely through AWS API)
 │
-├── Access Entries
-│   ├── Karpenter node role (EC2_LINUX) — lets Karpenter nodes join the cluster
-│   ├── Core node role (EC2_LINUX) — lets core infra nodes join the cluster
-│   └── Admin (Terraform IAM user) — cluster admin access
+├── Access Entries (who can access the cluster)
+│   ├── Karpenter node role (EC2_LINUX) — lets Karpenter-launched nodes join
+│   ├── Core node role (EC2_LINUX) — lets core infra nodes join
+│   └── Admin (Terraform IAM user) — full cluster admin access
 │
-├── Managed Node Group (core-infra)
-│   ├── 2x t3.medium across 2 AZs
+├── Core Node Group (always-on infrastructure tier)
+│   ├── 2x t3.medium across 2 AZs (private subnets)
 │   ├── Taint: CriticalAddonsOnly=true:NoSchedule
+│   ├── Label: node-role=core-infra
 │   └── Runs: Karpenter, ALB Controller, Metrics Server, CoreDNS
 │
-├── EKS Add-ons
-│   ├── vpc-cni — pod networking (assigns VPC IPs to pods)
-│   ├── kube-proxy — in-cluster service routing
-│   └── coredns — DNS resolution (pinned to core nodes)
+├── EKS Add-ons (managed by AWS)
+│   ├── vpc-cni — assigns VPC IPs to pods (DaemonSet on ALL nodes)
+│   ├── kube-proxy — in-cluster service routing (DaemonSet on ALL nodes)
+│   └── coredns — DNS resolution (pinned to core nodes via toleration + nodeSelector)
 │
-├── OIDC Provider — enables IRSA
-│   └── Registers EKS OIDC endpoint with IAM
+├── OIDC Provider — enables IRSA (IAM Roles for Service Accounts)
 │
 └── Cluster SG Tag — karpenter.sh/discovery for Karpenter
 ```
 
-- Both private and public API endpoint access enabled (reachable from VPC and your laptop)
-- OIDC provider is the foundation for IRSA — lets K8s service accounts assume IAM roles
-- Core managed node group is tainted with `CriticalAddonsOnly=true:NoSchedule` to prevent application workloads from scheduling on core infrastructure nodes
+**Resource-by-resource:**
 
-#### `iam.tf` — IAM Roles & Policies
+| Resource | What it does in simple words |
+|----------|-----|
+| `aws_eks_cluster.main` | Creates the EKS control plane — the Kubernetes API server, etcd, scheduler. AWS fully manages this. `endpoint_private_access = true` means pods can reach the API. `endpoint_public_access = true` means you can run kubectl from your laptop. `authentication_mode = "API"` means cluster access is managed through access entries below, not the legacy aws-auth ConfigMap |
+| `aws_eks_access_entry.karpenter_node` | "EC2 instances using the Karpenter node role are allowed to join this cluster." When Karpenter launches a new instance, this is how it registers with the cluster |
+| `aws_eks_access_entry.admin` | "The IAM identity running Terraform can access this cluster" |
+| `aws_eks_access_policy_association.admin` | "Give that admin identity full cluster admin permissions across all namespaces" |
+| `aws_eks_access_entry.core_node` | "EC2 instances using the core node role are allowed to join this cluster" |
+| `aws_eks_node_group.core` | The **Core Infrastructure Tier** — 2 always-on EC2 instances managed by EKS. The taint `CriticalAddonsOnly=true:NoSchedule` means "do NOT schedule any pod here UNLESS that pod explicitly tolerates this taint." Your application pods don't have this toleration, so they can never land here. Only system components (Karpenter, ALB Controller, Metrics Server, CoreDNS) have the matching toleration. The `node-role=core-infra` label lets those system components target these nodes via `nodeSelector`. `max_unavailable = 1` during updates ensures at least 1 core node is always running |
+| `aws_eks_addon.vpc_cni` | VPC CNI plugin — assigns real VPC IP addresses to pods so they can communicate directly with AWS resources. Runs as a DaemonSet on every node (both core and Karpenter). DaemonSets automatically tolerate all taints |
+| `aws_eks_addon.kube_proxy` | Maintains network rules on each node that make Kubernetes Services work (traffic to Service IP gets forwarded to the right pods). Also a DaemonSet on every node |
+| `aws_eks_addon.coredns` | Cluster DNS server — resolves names like `my-service.default.svc.cluster.local`. Unlike vpc-cni and kube-proxy, CoreDNS is a Deployment (not a DaemonSet), so it needs explicit tolerations and nodeSelector to run on the tainted core nodes |
+| `aws_iam_openid_connect_provider.eks` | Registers the EKS OIDC endpoint with IAM. This enables **IRSA**: a Kubernetes pod proves its identity via OIDC, AWS verifies it, and issues temporary credentials for a specific IAM role. Only the designated ServiceAccount gets AWS access, not every pod |
+| `aws_ec2_tag.cluster_sg_karpenter` | Tags the cluster's security group with `karpenter.sh/discovery` so Karpenter can find and attach it to new nodes |
+
+#### `iam.tf` — IAM Roles & Policies (who is allowed to do what)
+
+Each IAM role is like an ID badge that says "I am allowed to do these specific things." This file creates **5 roles**.
 
 ```
 IAM Roles
@@ -251,7 +291,7 @@ IAM Roles
 │   ├── Trust: ec2.amazonaws.com
 │   ├── AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy
 │   ├── AmazonEC2ContainerRegistryReadOnly, AmazonSSMManagedInstanceCore
-│   └── Instance Profile (required for EC2 launch)
+│   └── Instance Profile (required for Karpenter EC2 launch)
 │
 ├── Karpenter Controller Role (IRSA — used by the Karpenter pod)
 │   ├── Trust: OIDC federation (only kube-system:karpenter SA)
@@ -262,26 +302,42 @@ IAM Roles
     └── ELB, EC2 security groups, ACM certificates, WAF/Shield
 ```
 
+**Resource-by-resource:**
+
+| Resource | What it does in simple words |
+|----------|-----|
+| `data "aws_caller_identity"` | Looks up who is running Terraform (your IAM user/role ARN and account ID) |
+| `aws_iam_role.eks_cluster` | The EKS service needs this role to manage the control plane. Only `eks.amazonaws.com` can use it. Has `AmazonEKSClusterPolicy` |
+| `aws_iam_role.core_node` | The core infrastructure EC2 instances use this role. Only `ec2.amazonaws.com` can use it. 4 policies: register as EKS node, manage pod networking, pull images from ECR, allow SSM access for troubleshooting |
+| `aws_iam_role.karpenter_node` | Same 4 policies as core node, but for EC2 instances that Karpenter dynamically launches. Kept separate so changes to one don't break the other. Also has an **instance profile** because Karpenter creates its own launch templates (the managed node group handles instance profiles internally) |
+| `aws_iam_role.karpenter_controller` | The Karpenter pod assumes this via **IRSA**. Only the `kube-system:karpenter` ServiceAccount can use it (enforced by OIDC conditions). Permissions: launch/terminate EC2 instances, manage instance profiles, read cluster info, look up AMI IDs via SSM, query instance pricing to pick the cheapest option |
+| `aws_iam_role.alb_controller` | The ALB controller pod assumes this via **IRSA**. Only `kube-system:aws-load-balancer-controller` can use it. Permissions: create/modify/delete ALBs, manage security groups, register pod IPs as targets, manage TLS certificates, optionally attach WAF/Shield. Condition blocks ensure it only touches resources it created (tagged with `elbv2.k8s.aws/cluster`) |
+
 - **IRSA** restricts AWS permissions to specific K8s service accounts via OIDC conditions — only the designated pod gets AWS access, not every pod in the cluster
 - **Karpenter has two roles:** the controller role (to launch/terminate instances) and the node role (for launched instances to join the cluster and pull images)
+- **Core node role is separate from Karpenter node role** for blast-radius isolation — if you change one, the other is unaffected
 
 #### `ecr.tf` — Container Registry
 
-- Repository `icounter-api` with mutable tags (allows overwriting `:latest`)
-- Vulnerability scanning enabled on every push
-- Lifecycle policy auto-deletes untagged images beyond the last 10, preventing storage cost creep
+| Resource | What it does in simple words |
+|----------|-----|
+| `aws_ecr_repository.main` | Creates a private Docker registry named `icounter-api`. `scan_on_push = true` means every pushed image gets scanned for security vulnerabilities. `image_tag_mutability = MUTABLE` allows overwriting tags like `latest`. `force_delete = true` lets `terraform destroy` clean up even if images exist |
+| `aws_ecr_lifecycle_policy.main` | Cleanup rule: when there are more than 10 untagged images, delete the oldest ones. Prevents storage costs from growing forever |
 
 #### `outputs.tf` — Exported Values
 
-| Output | Consumed By |
-|--------|-------------|
-| `eks_cluster_endpoint` | Karpenter Helm install (`--set karpenter.settings.clusterEndpoint`) |
-| `eks_cluster_name` | kubectl config / reference |
-| `ecr_repository_url` | Docker push + Helm deploy (`--set image.repository`) |
-| `vpc_id` | ALB Controller Helm install (`--set vpcId`) |
-| `alb_controller_role_arn` | ALB Controller service account IRSA annotation |
-| `karpenter_controller_role_arn` | Karpenter service account IRSA annotation |
-| `kubeconfig_command` | Convenience command to configure kubectl |
+These are printed after `terraform apply` and consumed by Helm charts, kubectl, and CI/CD.
+
+| Output | What you use it for |
+|--------|-----|
+| `eks_cluster_endpoint` | The Kubernetes API server URL — passed to Karpenter Helm install |
+| `eks_cluster_name` | Used in kubectl config and Helm chart references |
+| `ecr_repository_url` | The full URL for `docker push` (e.g. `123456789.dkr.ecr.ap-south-1.amazonaws.com/icounter-api`) |
+| `vpc_id` | Needed by the ALB controller Helm chart to know which VPC to create load balancers in |
+| `alb_controller_role_arn` | Passed to ALB controller Helm chart for IRSA ServiceAccount annotation |
+| `karpenter_controller_role_arn` | Passed to Karpenter Helm chart for IRSA ServiceAccount annotation |
+| `core_node_role_arn` | Core node group's IAM role ARN — useful for debugging and auditing |
+| `kubeconfig_command` | Ready-to-run command to configure kubectl on your machine |
 
 #### How Terraform Files Connect
 
@@ -290,8 +346,8 @@ terraform.tfvars (inputs)
     │
     ▼
 vpc.tf ─────────────> eks.tf ──────────────> iam.tf
-(network foundation)  (cluster + OIDC)       (roles + policies)
-    │                     │                       │
+(network foundation)  (cluster + nodes       (roles + policies)
+                       + OIDC)                    │
     │                     │                       ▼
     │                     │                  IRSA binds K8s SAs
     │                     │                  to IAM roles via OIDC
@@ -301,16 +357,31 @@ ecr.tf               outputs.tf ──> Helm installs use these values
 (image storage)
 ```
 
-### Cost Estimate
+**Deployment flow after `terraform apply`:**
 
-| Component | Monthly Cost |
-|-----------|-------------|
-| EKS Control Plane | ~$73 |
-| Core Node Group (2x t3.medium) | ~$61 |
-| NAT Gateway | ~$32 |
-| **Idle Total** | **~$166** |
-| On-demand nodes (when active) | ~$30-60 (t3.medium ~$0.0416/hr) |
-| ALB (when active) | ~$16 |
+```
+1. VPC, subnets, IGW, NAT created
+2. IAM roles created (cluster, core node, karpenter node, karpenter controller, ALB controller)
+3. EKS cluster created
+4. Access entries registered (core nodes, karpenter nodes, admin)
+5. OIDC provider created (enables IRSA)
+6. Core node group launches 2x t3.medium (tainted, labeled)
+7. EKS addons install (vpc-cni, kube-proxy, CoreDNS → on core nodes)
+8. ECR repository created
+        │
+        ▼
+Helm installs (using Terraform outputs)
+├── Karpenter → schedules on core nodes (has toleration + nodeSelector)
+├── ALB Controller → schedules on core nodes
+└── Metrics Server → schedules on core nodes
+        │
+        ▼
+App deployment (via Jenkins)
+├── Image pushed to ECR
+├── Helm deploys pods — pods are unschedulable (no untainted nodes)
+├── Karpenter sees pending pods → launches new EC2 (application nodes)
+└── ALB Controller creates load balancer → traffic flows
+```
 
 ### Teardown
 
