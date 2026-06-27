@@ -117,6 +117,12 @@ aws eks update-kubeconfig --name icounter-cluster --region ap-south-1
 After Terraform creates the AWS infrastructure, install the Kubernetes components via Helm:
 
 ```bash
+# Add required Helm repositories (one-time setup)
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server
+helm repo add eks https://aws.github.io/eks-charts
+aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
+helm repo update
+
 # Get values from Terraform output
 EKS_ENDPOINT=$(terraform output -raw eks_cluster_endpoint)
 VPC_ID=$(terraform output -raw vpc_id)
@@ -137,7 +143,6 @@ helm upgrade --install alb-controller ../helm/alb-controller/ \
   --wait
 
 # 3. Install Karpenter
-aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
 helm dependency build ../helm/karpenter/
 helm upgrade --install karpenter ../helm/karpenter/ \
   -n kube-system \
