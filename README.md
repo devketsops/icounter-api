@@ -15,15 +15,19 @@ Developer ──> Git Push ──> Jenkins Pipeline
                               │
                       [Push to ECR]
                               │
+                   [Security Scan (ECR/Inspector)]
+                              │
+                  [Production Gate (if production)]
+                              │
                     [Deploy to EKS via Helm]
                               │
-                    [Verify Deployment]
+                 [Verify Deployment + Health Check]
 
-Internet ──> AWS ALB (Ingress) ──> K8s Service ──> Pods (:3000)
-                                                     │
-                                              [HPA scales pods]
-                                                     │
-                                          [Karpenter scales nodes]
+Internet ──> AWS ALB (Ingress) ──> NetworkPolicy ──> K8s Service ──> Pods (:3000)
+                                                                       │
+                                                                [HPA scales pods]
+                                                                       │
+                                                            [Karpenter scales nodes]
 ```
 
 ## Tech Stack
@@ -39,6 +43,8 @@ Internet ──> AWS ALB (Ingress) ──> K8s Service ──> Pods (:3000)
 | System Pods | EKS Managed Node Group (Core Infrastructure Tier) |
 | Load Balancer | AWS ALB (via AWS Load Balancer Controller) |
 | Pod Autoscaling | HPA (CPU + Memory) |
+| Security | NetworkPolicy, SecurityContext, PodDisruptionBudget |
+| Image Scanning | AWS ECR / Inspector (scan on push) |
 | Infrastructure | Terraform |
 
 ## Prerequisites
@@ -59,10 +65,11 @@ Internet ──> AWS ALB (Ingress) ──> K8s Service ──> Pods (:3000)
 │   ├── src/index.js        # Server entry point
 │   └── tests/app.test.js   # Jest unit tests
 ├── Dockerfile              # Multi-stage Docker build
-├── Jenkinsfile             # CI/CD pipeline (7 stages)
+├── Jenkinsfile             # CI/CD pipeline (8 stages)
 ├── helm/
 │   ├── icounter-api/       # Application Helm chart
-│   │   ├── templates/      # K8s manifests (deployment, service, ingress, hpa)
+│   │   ├── templates/      # K8s manifests (deployment, service, ingress, hpa,
+│   │   │                   #   networkpolicy, serviceaccount, pdb)
 │   │   ├── values.yaml     # Default values
 │   │   ├── values-staging.yaml
 │   │   └── values-production.yaml
@@ -253,7 +260,7 @@ EKS Cluster (icounter-cluster, v1.35)
 │   └── Runs: Karpenter, ALB Controller, Metrics Server, CoreDNS
 │
 ├── EKS Add-ons (managed by AWS)
-│   ├── vpc-cni — assigns VPC IPs to pods (DaemonSet on ALL nodes)
+│   ├── vpc-cni — assigns VPC IPs to pods + enforces NetworkPolicy (DaemonSet on ALL nodes)
 │   ├── kube-proxy — in-cluster service routing (DaemonSet on ALL nodes)
 │   └── coredns — DNS resolution (pinned to core nodes via toleration + nodeSelector)
 │
@@ -272,7 +279,7 @@ EKS Cluster (icounter-cluster, v1.35)
 | `aws_eks_access_policy_association.admin` | "Give that admin identity full cluster admin permissions across all namespaces" |
 | `aws_eks_access_entry.core_node` | "EC2 instances using the core node role are allowed to join this cluster" |
 | `aws_eks_node_group.core` | The **Core Infrastructure Tier** — 2 always-on EC2 instances managed by EKS. The taint `CriticalAddonsOnly=true:NoSchedule` means "do NOT schedule any pod here UNLESS that pod explicitly tolerates this taint." Your application pods don't have this toleration, so they can never land here. Only system components (Karpenter, ALB Controller, Metrics Server, CoreDNS) have the matching toleration. The `node-role=core-infra` label lets those system components target these nodes via `nodeSelector`. `max_unavailable = 1` during updates ensures at least 1 core node is always running |
-| `aws_eks_addon.vpc_cni` | VPC CNI plugin — assigns real VPC IP addresses to pods so they can communicate directly with AWS resources. Runs as a DaemonSet on every node (both core and Karpenter). DaemonSets automatically tolerate all taints |
+| `aws_eks_addon.vpc_cni` | VPC CNI plugin — assigns real VPC IP addresses to pods so they can communicate directly with AWS resources. Configured with `enableNetworkPolicy = true` to enforce Kubernetes NetworkPolicy resources. Runs as a DaemonSet on every node (both core and Karpenter). DaemonSets automatically tolerate all taints |
 | `aws_eks_addon.kube_proxy` | Maintains network rules on each node that make Kubernetes Services work (traffic to Service IP gets forwarded to the right pods). Also a DaemonSet on every node |
 | `aws_eks_addon.coredns` | Cluster DNS server — resolves names like `my-service.default.svc.cluster.local`. Unlike vpc-cni and kube-proxy, CoreDNS is a Deployment (not a DaemonSet), so it needs explicit tolerations and nodeSelector to run on the tainted core nodes |
 | `aws_iam_openid_connect_provider.eks` | Registers the EKS OIDC endpoint with IAM. This enables **IRSA**: a Kubernetes pod proves its identity via OIDC, AWS verifies it, and issues temporary credentials for a specific IAM role. Only the designated ServiceAccount gets AWS access, not every pod |
@@ -410,10 +417,17 @@ terraform destroy
 
 ## 2. Pipeline Flow (Step-by-Step)
 
-The Jenkins pipeline (`Jenkinsfile`) has 7 stages:
+The Jenkins pipeline (`Jenkinsfile`) has 8 stages with built-in security scanning, production gating, and credential management:
+
+### Pipeline Options
+
+- **Timestamps** on all console output
+- **45-minute timeout** to prevent runaway builds
+- **Concurrent build prevention** — only one build runs at a time
+- **Build log rotation** — keeps last 20 builds
 
 ### Stage 1: Checkout
-Pulls the latest source code from `https://github.com/devketsops/icounter-api.git`.
+Pulls the latest source code and captures a short git SHA. Image tags use `${BUILD_NUMBER}-${GIT_SHA_SHORT}` format for commit traceability.
 
 ### Stage 2: Build
 ```bash
@@ -435,40 +449,46 @@ Can be skipped via `SKIP_TESTS` parameter.
 
 ### Stage 4: Docker Build
 ```bash
-docker build -t <ECR_URL>/icounter-api:<BUILD_NUMBER> \
+docker pull <ECR_URL>/icounter-api:latest  # cache layer
+docker build --cache-from <ECR_URL>/icounter-api:latest \
+             -t <ECR_URL>/icounter-api:<IMAGE_TAG> \
              -t <ECR_URL>/icounter-api:latest .
 ```
-Multi-stage build: installs production deps, copies source, runs as non-root user. Final image is ~50MB (node:20-alpine).
+Multi-stage build: installs production deps, copies source, runs as non-root user. Final image is ~50MB (node:20-alpine). Pulls the latest image first and uses `--cache-from` for faster builds.
 
 ### Stage 5: Push to ECR
-```bash
-aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin <ECR_URL>
-docker push <ECR_URL>/icounter-api:<BUILD_NUMBER>
-docker push <ECR_URL>/icounter-api:latest
-```
-Authenticates with ECR and pushes both the versioned and latest tags.
+Authenticates with ECR via `withCredentials` and pushes both the versioned and latest tags. All AWS CLI calls are wrapped in explicit credential bindings.
 
-### Stage 6: Deploy to Kubernetes
+### Stage 6: Security Scan (AWS ECR / Inspector)
+```bash
+aws ecr wait image-scan-complete --repository-name icounter-api --image-id imageTag=<IMAGE_TAG>
+aws ecr describe-image-scan-findings --query 'imageScanFindings.findingSeverityCounts.CRITICAL'
+```
+Leverages ECR's `scan_on_push` (backed by AWS Inspector). Waits for the scan to complete, then checks for CRITICAL vulnerabilities. If any are found, the build fails and deployment is blocked.
+
+### Stage 7: Deploy to Kubernetes
 ```bash
 helm upgrade --install icounter-api ./helm/icounter-api \
     --namespace icounter \
     -f helm/icounter-api/values-<ENVIRONMENT>.yaml \
     --set image.repository=<ECR_URL>/icounter-api \
-    --set image.tag=<BUILD_NUMBER> \
+    --set image.tag=<IMAGE_TAG> \
     --wait --timeout 300s
 ```
+- **Production gate**: production deploys require manual approval and can only run from the `main` branch
 - Creates namespace if it doesn't exist
 - Uses environment-specific values file (staging/production)
+- Uses `--dry-run=client` when DRY_RUN parameter is enabled
 - `--wait` ensures pipeline reports success only after pods are healthy
-- Karpenter (installed separately via Helm) automatically provisions an on-demand node when pods are scheduled
+- Karpenter automatically provisions an on-demand node when pods are scheduled
 
-### Stage 7: Verify Deployment
+### Stage 8: Verify Deployment
 ```bash
 kubectl rollout status deployment/icounter-api -n icounter --timeout=120s
-kubectl get pods -n icounter -l app.kubernetes.io/name=icounter-api
-kubectl get ingress -n icounter
+kubectl get pods -n icounter -l app=icounter-api
+kubectl exec <pod> -- wget -qO- http://localhost:3000/health
 ```
-Confirms rollout succeeded, lists running pods, and shows ALB endpoint.
+Confirms rollout succeeded, lists running pods, shows ALB endpoint, and verifies the `/health` endpoint responds from inside a running pod.
 
 ### Pipeline Parameters
 
@@ -477,6 +497,13 @@ Confirms rollout succeeded, lists running pods, and shows ALB endpoint.
 | ENVIRONMENT | staging | Target environment (staging/production) |
 | SKIP_TESTS | false | Skip unit test stage |
 | DRY_RUN | false | Helm dry-run only (no actual deploy) |
+
+### Jenkins Credentials Required
+
+| Credential ID | Type | Purpose |
+|---|---|---|
+| `ecr-registry-url` | Secret Text | ECR registry URL |
+| `aws-credentials` | AWS Credentials | AWS access key + secret for CLI calls |
 
 ---
 
@@ -505,7 +532,7 @@ strategy:
 ### Rollback
 
 **Automatic (on pipeline failure):**
-The Jenkinsfile `post.failure` block automatically rolls back:
+The Jenkinsfile `post.failure` block automatically rolls back (wrapped in AWS credentials for EKS exec-based kubeconfig):
 ```bash
 helm rollback icounter-api 0 --namespace icounter
 ```
@@ -723,6 +750,74 @@ This approach:
 - Supports automatic rotation
 - Provides audit logging via CloudTrail
 - Eliminates base64-encoded secrets from Git/Helm values
+
+---
+
+## 8. Security Hardening
+
+### Pod & Container Security Context
+
+The Deployment template enforces strict security constraints at both pod and container level:
+
+**Pod-level:**
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `runAsNonRoot` | `true` | Kubelet refuses to start the container if it resolves to UID 0 |
+| `runAsUser` | `100` | Enforces UID 100 (matches Alpine's `appuser`) regardless of Dockerfile |
+| `runAsGroup` | `101` | Enforces GID 101 (matches Alpine's `appgroup`) |
+| `fsGroup` | `101` | Volumes are writable by the group |
+| `seccompProfile` | `RuntimeDefault` | Blocks ~40 dangerous syscalls (mount, reboot, ptrace) |
+
+**Container-level:**
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `allowPrivilegeEscalation` | `false` | Blocks setuid binaries and privilege escalation |
+| `readOnlyRootFilesystem` | `true` | Container filesystem is read-only (writable `/tmp` via emptyDir) |
+| `capabilities.drop` | `[ALL]` | Removes all Linux capabilities — the Express app needs none |
+
+### ServiceAccount
+
+A dedicated ServiceAccount with `automountServiceAccountToken: false` — the Express app has no need for Kubernetes API access. Supports IRSA annotations for future AWS API access:
+
+```yaml
+serviceAccount:
+  create: true
+  automountServiceAccountToken: false
+  annotations: {}
+  # annotations:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/my-role
+```
+
+### NetworkPolicy
+
+Controls traffic in and out of application pods:
+
+```
+Ingress: VPC CIDR (10.0.0.0/16) ──> TCP 3000 ──> Pods
+Egress:  Pods ──> UDP/TCP 53 (kube-system DNS)
+         Pods ──> 0.0.0.0/0 (databases, external APIs)
+```
+
+- **Ingress** is restricted to the VPC CIDR on the container port. Since the ALB uses `target-type: ip`, traffic arrives from VPC ENIs, so a CIDR-based rule is used instead of a pod selector.
+- **Egress DNS** is limited to the `kube-system` namespace where CoreDNS runs.
+- **Egress outbound** allows all other traffic for database and external API connectivity.
+- **Enforcement** requires the VPC CNI addon with `enableNetworkPolicy = true` (configured in Terraform).
+
+### PodDisruptionBudget
+
+```yaml
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+```
+
+Ensures at least one pod survives voluntary disruptions — node drains, cluster upgrades, and Karpenter spot instance consolidation. Critical because the production NodePool uses spot instances with `WhenEmptyOrUnderutilized` consolidation, which actively rotates nodes.
+
+### Image Scanning
+
+ECR's `scan_on_push` (backed by AWS Inspector) scans every pushed image. The Jenkins pipeline waits for scan results and blocks deployment if CRITICAL vulnerabilities are found.
 
 ---
 

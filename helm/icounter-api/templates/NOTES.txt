@@ -8,3 +8,14 @@ To check pod status:
 
 To check HPA status:
   kubectl get hpa {{ include "app.name" . }} -n {{ .Release.Namespace }}
+{{- if .Values.networkPolicy.enabled }}
+
+NetworkPolicy is enabled. Ensure the VPC CNI addon has ENABLE_NETWORK_POLICY=true.
+Allowed ingress CIDRs: {{ .Values.networkPolicy.ingress.fromCIDR }}
+  kubectl get networkpolicy {{ include "app.name" . }} -n {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.podDisruptionBudget.enabled }}
+
+PodDisruptionBudget is active (minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}).
+  kubectl get pdb {{ include "app.name" . }} -n {{ .Release.Namespace }}
+{{- end }}

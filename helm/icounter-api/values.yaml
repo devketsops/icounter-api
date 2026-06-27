@@ -29,3 +29,42 @@ config:
 secrets:
   dbPassword: bW9ja2VkLXBhc3N3b3Jk
   apiKey: bW9ja2VkLWFwaS1rZXk=
+
+securityContext:
+  pod:
+    runAsNonRoot: true
+    runAsUser: 100
+    runAsGroup: 101
+    fsGroup: 101
+    seccompProfile:
+      type: RuntimeDefault
+  container:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 100
+    runAsGroup: 101
+    capabilities:
+      drop:
+        - ALL
+
+serviceAccount:
+  create: true
+  automountServiceAccountToken: false
+  annotations: {}
+
+networkPolicy:
+  enabled: true
+  ingress:
+    fromCIDR:
+      - 10.0.0.0/16
+  egress:
+    dns:
+      enabled: true
+      namespaceSelector:
+        kubernetes.io/metadata.name: kube-system
+    allowAllOutbound: true
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
