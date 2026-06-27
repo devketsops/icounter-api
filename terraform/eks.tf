@@ -10,7 +10,7 @@ resource "aws_eks_cluster" "main" {
   }
 
   access_config {
-    authentication_mode = "API_AND_CONFIG_MAP"
+    authentication_mode = "API"
   }
 
   tags = {
@@ -43,20 +43,53 @@ resource "aws_eks_access_policy_association" "admin" {
   }
 }
 
-# Fargate profile for system components (kube-system namespace)
-resource "aws_eks_fargate_profile" "kube_system" {
-  cluster_name           = aws_eks_cluster.main.name
-  fargate_profile_name   = "${var.project_name}-kube-system"
-  pod_execution_role_arn = aws_iam_role.fargate_pod_execution.arn
-  subnet_ids             = aws_subnet.private[*].id
+# Allow core managed node group nodes to join the cluster
+resource "aws_eks_access_entry" "core_node" {
+  cluster_name  = aws_eks_cluster.main.name
+  principal_arn = aws_iam_role.core_node.arn
+  type          = "EC2_LINUX"
+}
 
-  selector {
-    namespace = "kube-system"
+# Core infrastructure managed node group
+resource "aws_eks_node_group" "core" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "${var.project_name}-core-infra"
+  node_role_arn   = aws_iam_role.core_node.arn
+  subnet_ids      = aws_subnet.private[*].id
+
+  instance_types = var.core_node_instance_types
+
+  scaling_config {
+    desired_size = var.core_node_desired_size
+    min_size     = var.core_node_min_size
+    max_size     = var.core_node_max_size
+  }
+
+  taint {
+    key    = "CriticalAddonsOnly"
+    value  = "true"
+    effect = "NO_SCHEDULE"
+  }
+
+  labels = {
+    "node-role" = "core-infra"
+  }
+
+  update_config {
+    max_unavailable = 1
   }
 
   tags = {
+    Name        = "${var.project_name}-core-infra"
     Environment = var.environment
   }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.core_node_worker,
+    aws_iam_role_policy_attachment.core_node_cni,
+    aws_iam_role_policy_attachment.core_node_ecr,
+    aws_iam_role_policy_attachment.core_node_ssm,
+  ]
 }
 
 # EKS Add-ons
@@ -64,14 +97,14 @@ resource "aws_eks_addon" "vpc_cni" {
   cluster_name = aws_eks_cluster.main.name
   addon_name   = "vpc-cni"
 
-  depends_on = [aws_eks_fargate_profile.kube_system]
+  depends_on = [aws_eks_node_group.core]
 }
 
 resource "aws_eks_addon" "kube_proxy" {
   cluster_name = aws_eks_cluster.main.name
   addon_name   = "kube-proxy"
 
-  depends_on = [aws_eks_fargate_profile.kube_system]
+  depends_on = [aws_eks_node_group.core]
 }
 
 resource "aws_eks_addon" "coredns" {
@@ -79,21 +112,23 @@ resource "aws_eks_addon" "coredns" {
   addon_name   = "coredns"
 
   configuration_values = jsonencode({
-    computeType = "Fargate"
+    tolerations = [{
+      key      = "CriticalAddonsOnly"
+      operator = "Exists"
+      effect   = "NoSchedule"
+    }]
+    nodeSelector = {
+      "node-role" = "core-infra"
+    }
   })
 
-  depends_on = [aws_eks_fargate_profile.kube_system]
+  depends_on = [aws_eks_node_group.core]
 }
 
 # OIDC provider for IRSA
-data "tls_certificate" "eks" {
-  url = aws_eks_cluster.main.identity[0].oidc[0].issuer
-}
-
 resource "aws_iam_openid_connect_provider" "eks" {
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
-  url             = aws_eks_cluster.main.identity[0].oidc[0].issuer
+  client_id_list = ["sts.amazonaws.com"]
+  url            = aws_eks_cluster.main.identity[0].oidc[0].issuer
 
   tags = {
     Name        = "${var.project_name}-eks-oidc"

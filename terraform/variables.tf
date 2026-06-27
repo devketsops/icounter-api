@@ -27,3 +27,28 @@ variable "eks_cluster_version" {
   type        = string
   default     = "1.35"
 }
+
+variable "core_node_instance_types" {
+  description = "Instance types for the core infrastructure managed node group"
+  type        = list(string)
+  default     = ["t3.medium"]
+}
+
+variable "core_node_desired_size" {
+  description = "Desired number of core infrastructure nodes"
+  type        = number
+  default     = 2
+}
+
+variable "core_node_min_size" {
+  description = "Minimum number of core infrastructure nodes"
+  type        = number
+  default     = 2
+}
+
+variable "core_node_max_size" {
+  description = "Maximum number of core infrastructure nodes"
+  type        = number
+  default     = 3
+}
+

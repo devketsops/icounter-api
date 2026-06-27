@@ -26,10 +26,10 @@ resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
   role       = aws_iam_role.eks_cluster.name
 }
 
-# --- Fargate Pod Execution Role ---
+# --- Core Node Group Role ---
 
-resource "aws_iam_role" "fargate_pod_execution" {
-  name = "${var.project_name}-fargate-pod-execution-role"
+resource "aws_iam_role" "core_node" {
+  name = "${var.project_name}-core-node-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -37,7 +37,7 @@ resource "aws_iam_role" "fargate_pod_execution" {
       Action = "sts:AssumeRole"
       Effect = "Allow"
       Principal = {
-        Service = "eks-fargate-pods.amazonaws.com"
+        Service = "ec2.amazonaws.com"
       }
     }]
   })
@@ -47,9 +47,24 @@ resource "aws_iam_role" "fargate_pod_execution" {
   }
 }
 
-resource "aws_iam_role_policy_attachment" "fargate_pod_execution" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSFargatePodExecutionRolePolicy"
-  role       = aws_iam_role.fargate_pod_execution.name
+resource "aws_iam_role_policy_attachment" "core_node_worker" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+  role       = aws_iam_role.core_node.name
+}
+
+resource "aws_iam_role_policy_attachment" "core_node_cni" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+  role       = aws_iam_role.core_node.name
+}
+
+resource "aws_iam_role_policy_attachment" "core_node_ecr" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  role       = aws_iam_role.core_node.name
+}
+
+resource "aws_iam_role_policy_attachment" "core_node_ssm" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  role       = aws_iam_role.core_node.name
 }
 
 # --- Karpenter Node Role ---

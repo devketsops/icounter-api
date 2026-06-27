@@ -27,10 +27,10 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true
 
   tags = {
-    Name                                             = "${var.project_name}-public-${local.azs[count.index]}"
-    Environment                                      = var.environment
-    "kubernetes.io/role/elb"                          = "1"
-    "kubernetes.io/cluster/${local.cluster_name}"     = "shared"
+    Name                                          = "${var.project_name}-public-${local.azs[count.index]}"
+    Environment                                   = var.environment
+    "kubernetes.io/role/elb"                      = "1"
+    "kubernetes.io/cluster/${local.cluster_name}" = "shared"
   }
 }
 
@@ -42,11 +42,11 @@ resource "aws_subnet" "private" {
   availability_zone = local.azs[count.index]
 
   tags = {
-    Name                                             = "${var.project_name}-private-${local.azs[count.index]}"
-    Environment                                      = var.environment
-    "kubernetes.io/role/internal-elb"                 = "1"
-    "kubernetes.io/cluster/${local.cluster_name}"     = "shared"
-    "karpenter.sh/discovery"                          = local.cluster_name
+    Name                                          = "${var.project_name}-private-${local.azs[count.index]}"
+    Environment                                   = var.environment
+    "kubernetes.io/role/internal-elb"             = "1"
+    "kubernetes.io/cluster/${local.cluster_name}" = "shared"
+    "karpenter.sh/discovery"                      = local.cluster_name
   }
 }
 

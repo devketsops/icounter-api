@@ -28,6 +28,11 @@ output "karpenter_controller_role_arn" {
   value       = aws_iam_role.karpenter_controller.arn
 }
 
+output "core_node_role_arn" {
+  description = "Core infrastructure node group IAM role ARN"
+  value       = aws_iam_role.core_node.arn
+}
+
 output "kubeconfig_command" {
   description = "Command to configure kubectl"
   value       = "aws eks update-kubeconfig --name ${aws_eks_cluster.main.name} --region ${var.aws_region}"

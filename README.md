@@ -36,7 +36,7 @@ Internet ──> AWS ALB (Ingress) ──> K8s Service ──> Pods (:3000)
 | Container Registry | AWS ECR |
 | Kubernetes | Amazon EKS (v1.35) |
 | Node Provisioning | Karpenter (on-demand) |
-| System Pods | AWS Fargate |
+| System Pods | EKS Managed Node Group (Core Infrastructure Tier) |
 | Load Balancer | AWS ALB (via AWS Load Balancer Controller) |
 | Pod Autoscaling | HPA (CPU + Memory) |
 | Infrastructure | Terraform |
@@ -78,8 +78,8 @@ Internet ──> AWS ALB (Ingress) ──> K8s Service ──> Pods (:3000)
 │       └── values.yaml     # Default values
 └── terraform/              # AWS infrastructure (pure AWS resources, no Helm/K8s)
     ├── vpc.tf              # VPC, subnets, NAT, route tables
-    ├── iam.tf              # All IAM roles (EKS, Fargate, Karpenter, ALB)
-    ├── eks.tf              # EKS cluster, Fargate profile, add-ons, OIDC
+    ├── iam.tf              # All IAM roles (EKS, Core Node, Karpenter, ALB)
+    ├── eks.tf              # EKS cluster, core node group, add-ons, OIDC
     ├── ecr.tf              # ECR repository + lifecycle policy
     ├── providers.tf        # AWS and TLS providers
     ├── variables.tf        # Input variables
@@ -152,7 +152,7 @@ helm upgrade --install karpenter ../helm/karpenter/ \
 | Resource | Details |
 |----------|---------|
 | VPC | 10.0.0.0/16, 2 AZs, single NAT gateway |
-| EKS | v1.35, Fargate profile for kube-system |
+| EKS | v1.35, managed node group for core infrastructure |
 | ECR | `icounter-api` repository with lifecycle policy |
 | Karpenter IAM | Controller IRSA role + node role (Terraform), controller + CRDs (Helm) |
 | ALB Controller IAM | IRSA role (Terraform), controller deployment (Helm) |
@@ -208,19 +208,22 @@ VPC (10.0.0.0/16)
 ```
 EKS Cluster (icounter-cluster, v1.35)
 ├── VPC Config: all 4 subnets, public + private endpoint access
-├── Auth: API_AND_CONFIG_MAP mode
+├── Auth: API mode
 │
 ├── Access Entries
-│   ├── Karpenter node role (EC2_LINUX) — lets nodes join the cluster
+│   ├── Karpenter node role (EC2_LINUX) — lets Karpenter nodes join the cluster
+│   ├── Core node role (EC2_LINUX) — lets core infra nodes join the cluster
 │   └── Admin (Terraform IAM user) — cluster admin access
 │
-├── Fargate Profile (kube-system namespace)
-│   └── System pods run serverlessly on Fargate
+├── Managed Node Group (core-infra)
+│   ├── 2x t3.medium across 2 AZs
+│   ├── Taint: CriticalAddonsOnly=true:NoSchedule
+│   └── Runs: Karpenter, ALB Controller, Metrics Server, CoreDNS
 │
 ├── EKS Add-ons
 │   ├── vpc-cni — pod networking (assigns VPC IPs to pods)
 │   ├── kube-proxy — in-cluster service routing
-│   └── coredns — DNS resolution (Fargate-compatible)
+│   └── coredns — DNS resolution (pinned to core nodes)
 │
 ├── OIDC Provider — enables IRSA
 │   └── Registers EKS OIDC endpoint with IAM
@@ -230,7 +233,7 @@ EKS Cluster (icounter-cluster, v1.35)
 
 - Both private and public API endpoint access enabled (reachable from VPC and your laptop)
 - OIDC provider is the foundation for IRSA — lets K8s service accounts assume IAM roles
-- Fargate profile targets `kube-system` namespace so system pods need no EC2 nodes
+- Core managed node group is tainted with `CriticalAddonsOnly=true:NoSchedule` to prevent application workloads from scheduling on core infrastructure nodes
 
 #### `iam.tf` — IAM Roles & Policies
 
@@ -239,10 +242,12 @@ IAM Roles
 ├── EKS Cluster Role
 │   └── Trust: eks.amazonaws.com → AmazonEKSClusterPolicy
 │
-├── Fargate Pod Execution Role
-│   └── Trust: eks-fargate-pods.amazonaws.com → AmazonEKSFargatePodExecutionRolePolicy
+├── Core Node Group Role (attached to core infrastructure EC2 instances)
+│   ├── Trust: ec2.amazonaws.com
+│   └── AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy
+│       AmazonEC2ContainerRegistryReadOnly, AmazonSSMManagedInstanceCore
 │
-├── Karpenter Node Role (attached to launched EC2 instances)
+├── Karpenter Node Role (attached to Karpenter-launched EC2 instances)
 │   ├── Trust: ec2.amazonaws.com
 │   ├── AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy
 │   ├── AmazonEC2ContainerRegistryReadOnly, AmazonSSMManagedInstanceCore
@@ -301,9 +306,9 @@ ecr.tf               outputs.tf ──> Helm installs use these values
 | Component | Monthly Cost |
 |-----------|-------------|
 | EKS Control Plane | ~$73 |
-| Fargate (system pods) | ~$29 |
+| Core Node Group (2x t3.medium) | ~$61 |
 | NAT Gateway | ~$32 |
-| **Idle Total** | **~$134** |
+| **Idle Total** | **~$166** |
 | On-demand nodes (when active) | ~$30-60 (t3.medium ~$0.0416/hr) |
 | ALB (when active) | ~$16 |
 
@@ -454,9 +459,9 @@ kubectl rollout undo deployment/icounter-api -n icounter
 
 ### EKS (Elastic Kubernetes Service)
 - Managed Kubernetes v1.35 cluster
-- Fargate profiles for system components (no EC2 nodes needed for cluster operations)
+- Core infrastructure managed node group (2x t3.medium) with CriticalAddonsOnly taint for system components
 - OIDC provider for IRSA (IAM Roles for Service Accounts)
-- EKS add-ons: vpc-cni, kube-proxy, CoreDNS (Fargate-compatible)
+- EKS add-ons: vpc-cni, kube-proxy, CoreDNS
 
 ### ALB (Application Load Balancer)
 - Provisioned automatically by AWS Load Balancer Controller from Kubernetes Ingress resources
@@ -603,7 +608,7 @@ All pods removed? → 30s later → node terminated (scale to zero)
 ```
 
 **Scale-to-Zero:**
-When all application pods are removed (e.g., `helm uninstall`), Karpenter terminates all nodes within 30 seconds. System pods continue running on Fargate (no EC2 cost).
+When all application pods are removed (e.g., `helm uninstall`), Karpenter terminates all application nodes within 30 seconds. The core infrastructure node group (2x t3.medium) remains running to host system components (Karpenter, ALB Controller, Metrics Server, CoreDNS).
 
 **Consolidation:**
 Karpenter continuously monitors node utilization. If pods can be packed onto fewer nodes, it cordons the underutilized node, reschedules pods, and terminates it. This keeps compute costs minimal.

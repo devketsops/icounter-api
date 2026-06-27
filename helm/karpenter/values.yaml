@@ -10,6 +10,12 @@ karpenter:
     annotations:
       eks.amazonaws.com/role-arn: ""  # Set at install time: --set karpenter.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=<ROLE_ARN>
   replicas: 1
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      operator: "Exists"
+      effect: "NoSchedule"
+  nodeSelector:
+    node-role: "core-infra"
 
 # --- EC2NodeClass ---
 nodeClass:
