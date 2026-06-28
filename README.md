@@ -37,8 +37,8 @@ Internet ──> AWS ALB (Ingress) ──> NetworkPolicy ──> K8s Service ─
 
 | Component | Technology |
 |-----------|-----------|
-| Application | Node.js + Express |
-| Container | Docker (multi-stage build) |
+| Application | Node.js 22 + Express 5 |
+| Container | Docker (multi-stage build, node:22-alpine) |
 | CI/CD | Jenkins (Declarative Pipeline) + GitHub Actions |
 | Container Registry | AWS ECR |
 | Kubernetes | Amazon EKS (v1.35) |
@@ -57,7 +57,7 @@ Internet ──> AWS ALB (Ingress) ──> NetworkPolicy ──> K8s Service ─
 - kubectl
 - Helm v3
 - Docker
-- Node.js >= 20 (for local development)
+- Node.js >= 22 (for local development)
 - Jenkins with plugins: Pipeline, Docker Pipeline, AWS Credentials, Kubernetes CLI
 
 ## Project Structure
@@ -459,7 +459,7 @@ docker build --cache-from <ECR_URL>/icounter-api:latest \
              -t <ECR_URL>/icounter-api:<IMAGE_TAG> \
              -t <ECR_URL>/icounter-api:latest .
 ```
-Multi-stage build: installs production deps, copies source, runs as non-root user. Final image is ~50MB (node:20-alpine). Pulls the latest image first and uses `--cache-from` for faster builds.
+Multi-stage build: installs production deps, copies source, runs as non-root user. Final image is ~50MB (node:22-alpine). OS packages are patched at build time via `apk upgrade`. Pulls the latest image first and uses `--cache-from` for faster builds.
 
 ### Stage 5: Push to ECR
 Authenticates with ECR via `withCredentials` and pushes both the versioned and latest tags. All AWS CLI calls are wrapped in explicit credential bindings.

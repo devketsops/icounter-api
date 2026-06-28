@@ -1,11 +1,17 @@
 node_modules
 .git
+.github/
 terraform/
 helm/
 Jenkinsfile
 README.md
 *.md
 .env
+.env.*
 .dockerignore
+Dockerfile
 app/tests/
 app/coverage/
+*.tfstate
+*.tfstate.backup
+DevOps Assignement.pdf

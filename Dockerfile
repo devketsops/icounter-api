@@ -1,15 +1,16 @@
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
 COPY app/package*.json ./
-RUN npm ci --only=production
+RUN npm ci --omit=dev
 
 COPY app/src/ ./src/
 
-FROM node:20-alpine
+FROM node:22-alpine
 
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+RUN apk upgrade --no-cache && \
+    addgroup -S appgroup && adduser -S appuser -G appgroup
 
 WORKDIR /app
 
