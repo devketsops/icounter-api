@@ -980,6 +980,30 @@ ECR's `scan_on_push` (backed by AWS Inspector) scans every pushed image. The Jen
 
 ---
 
+## API Endpoints
+
+The application is exposed via AWS ALB at:
+
+```
+http://k8s-icounter-icounter-9befeeafff-1833990550.ap-south-1.elb.amazonaws.com
+```
+
+| Endpoint | URL | Description |
+|----------|-----|-------------|
+| **Health Check** | `/health` | Returns `{ status: "healthy" }` with timestamp and app version |
+| **API Root** | `/api` | Returns welcome message and current environment |
+| **API Info** | `/api/info` | Returns service name and server uptime |
+
+**Test the endpoints:**
+
+```bash
+curl http://k8s-icounter-icounter-9befeeafff-1833990550.ap-south-1.elb.amazonaws.com/health
+curl http://k8s-icounter-icounter-9befeeafff-1833990550.ap-south-1.elb.amazonaws.com/api
+curl http://k8s-icounter-icounter-9befeeafff-1833990550.ap-south-1.elb.amazonaws.com/api/info
+```
+
+---
+
 ## Local Development
 
 ```bash
