@@ -537,7 +537,7 @@ The GitHub Actions workflow (`.github/workflows/deploy.yml`) provides an alterna
   │  Build & Test     │  ◄── Runs on ALL triggers
   │                   │
   │  • Checkout code  │
-  │  • Node.js 20     │
+  │  • Node.js 22     │
   │  • npm ci         │
   │  • npm test       │
   └────────┬─────────┘
