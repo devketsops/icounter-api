@@ -53,7 +53,7 @@ Internet ──> AWS ALB (Ingress) ──> NetworkPolicy ──> K8s Service ─
 ## Prerequisites
 
 - AWS CLI v2 configured with credentials
-- Terraform >= 1.5
+- Terraform >= 1.10
 - kubectl
 - Helm v3
 - Docker
@@ -200,11 +200,16 @@ helm upgrade --install karpenter ../helm/karpenter/ \
 
 #### `backend.tf` — State Storage
 
-Currently commented out, so Terraform saves its state as a local file on your machine (`terraform.tfstate`). The commented block shows the production-ready setup:
+Uses an S3 remote backend for state management:
 
-- **S3 bucket** — stores state remotely so a team can share it
-- **DynamoDB table** — prevents two people from running `terraform apply` at the same time (state locking)
+- **S3 bucket** (`icounter-terraform-state`) — stores state remotely so a team can share it, with versioning and encryption
+- **S3-native locking** (`use_lockfile = true`) — uses S3 conditional writes to prevent two people from running `terraform apply` at the same time. No DynamoDB table required (requires Terraform >= 1.10)
 - **encrypt = true** — state contains sensitive info (ARNs, endpoints), so encrypt it at rest
+
+To migrate from local to remote state:
+```bash
+terraform init -migrate-state
+```
 
 #### `vpc.tf` — Networking
 
