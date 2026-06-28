@@ -1,27 +1,30 @@
 # iCOUNTER API — CI/CD Pipeline on AWS + Kubernetes
 
-Production-style CI/CD pipeline using Jenkins to deploy a containerized Node.js Express API to Amazon EKS, exposed via AWS ALB, with Karpenter-based node provisioning (on-demand) and scale-to-zero capability.
+Production-style CI/CD pipeline using Jenkins and GitHub Actions to deploy a containerized Node.js Express API to Amazon EKS, exposed via AWS ALB, with Karpenter-based node provisioning (on-demand) and scale-to-zero capability.
 
 ## Architecture
 
 ```
-Developer ──> Git Push ──> Jenkins Pipeline
-                              │
-              ┌───────────────┼───────────────────────┐
-              │               │                       │
-          [Build]        [Unit Test]             [Docker Build]
-              │               │                       │
-              └───────────────┼───────────────────────┘
-                              │
-                      [Push to ECR]
-                              │
-                   [Security Scan (ECR/Inspector)]
-                              │
-                  [Production Gate (if production)]
-                              │
-                    [Deploy to EKS via Helm]
-                              │
-                 [Verify Deployment + Health Check]
+                       ┌──────────────────┐
+Developer ──> Git Push │  Jenkins         │
+                       │  GitHub Actions  │
+                       └────────┬─────────┘
+                                │
+                ┌───────────────┼───────────────────────┐
+                │               │                       │
+            [Build]        [Unit Test]             [Docker Build]
+                │               │                       │
+                └───────────────┼───────────────────────┘
+                                │
+                        [Push to ECR]
+                                │
+                     [Security Scan (ECR/Inspector)]
+                                │
+                    [Production Gate (if production)]
+                                │
+                      [Deploy to EKS via Helm]
+                                │
+                   [Verify Deployment + Health Check]
 
 Internet ──> AWS ALB (Ingress) ──> NetworkPolicy ──> K8s Service ──> Pods (:3000)
                                                                        │
@@ -36,7 +39,7 @@ Internet ──> AWS ALB (Ingress) ──> NetworkPolicy ──> K8s Service ─
 |-----------|-----------|
 | Application | Node.js + Express |
 | Container | Docker (multi-stage build) |
-| CI/CD | Jenkins (Declarative Pipeline) |
+| CI/CD | Jenkins (Declarative Pipeline) + GitHub Actions |
 | Container Registry | AWS ECR |
 | Kubernetes | Amazon EKS (v1.35) |
 | Node Provisioning | Karpenter (on-demand) |
@@ -64,8 +67,10 @@ Internet ──> AWS ALB (Ingress) ──> NetworkPolicy ──> K8s Service ─
 │   ├── src/app.js          # Express app (routes: /health, /api, /api/info)
 │   ├── src/index.js        # Server entry point
 │   └── tests/app.test.js   # Jest unit tests
+├── .github/workflows/
+│   └── deploy.yml          # GitHub Actions CI/CD workflow
 ├── Dockerfile              # Multi-stage Docker build
-├── Jenkinsfile             # CI/CD pipeline (8 stages)
+├── Jenkinsfile             # Jenkins CI/CD pipeline (8 stages)
 ├── helm/
 │   ├── icounter-api/       # Application Helm chart
 │   │   ├── templates/      # K8s manifests (deployment, service, ingress, hpa,
@@ -388,7 +393,7 @@ Helm installs (using Terraform outputs)
 └── Metrics Server → schedules on core nodes
         │
         ▼
-App deployment (via Jenkins)
+App deployment (via Jenkins or GitHub Actions)
 ├── Image pushed to ECR
 ├── Helm deploys pods — pods are unschedulable (no untainted nodes)
 ├── Karpenter sees pending pods → launches new EC2 (application nodes)
@@ -507,7 +512,156 @@ Confirms rollout succeeded, lists running pods, shows ALB endpoint, and verifies
 
 ---
 
-## 3. Deployment Strategy + Rollback
+## 3. GitHub Actions CI/CD Pipeline
+
+The GitHub Actions workflow (`.github/workflows/deploy.yml`) provides an alternative CI/CD pipeline with branch-based environment selection and GitHub Environments for production approval gating.
+
+### Pipeline Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        GitHub Actions Workflow                         │
+│                     .github/workflows/deploy.yml                       │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────┐
+  │   Trigger Event   │
+  └────────┬─────────┘
+           │
+           ├── Pull Request to main
+           ├── Push to main
+           └── Tag v* (e.g. v1.0.0)
+           │
+           ▼
+  ┌──────────────────┐
+  │  Build & Test     │  ◄── Runs on ALL triggers
+  │                   │
+  │  • Checkout code  │
+  │  • Node.js 20     │
+  │  • npm ci         │
+  │  • npm test       │
+  └────────┬─────────┘
+           │
+           ├── PR? ──────────────────────────────────── ✅ Done (no deploy)
+           │
+           ▼  (push to main or tag v*)
+  ┌──────────────────┐
+  │ Docker Build &    │
+  │ Push to ECR       │
+  │                   │
+  │ • AWS credentials │
+  │ • ECR login       │
+  │ • Build amd64     │
+  │ • Tag: run#-sha   │
+  │ • Push to ECR     │
+  └────────┬─────────┘
+           │
+           ▼
+  ┌──────────────────┐
+  │  Security Scan    │
+  │                   │
+  │ • ECR image scan  │
+  │ • Wait for result │
+  │ • Fail on         │
+  │   CRITICAL vulns  │
+  └────────┬─────────┘
+           │
+     ┌─────┴──────┐
+     │            │
+     ▼            ▼
+  (main)       (tag v*)
+     │            │
+     ▼            ▼
+  ┌────────┐  ┌────────────────┐
+  │Staging │  │  Production    │
+  │        │  │                │
+  │No gate │  │ ⏸ Manual       │
+  │        │  │   Approval     │
+  │ values-│  │   Required     │
+  │staging │  │                │
+  │ .yaml  │  │ values-        │
+  │        │  │ production.yaml│
+  └───┬────┘  └──────┬─────────┘
+      │              │
+      ▼              ▼
+  ┌──────────────────────────────┐
+  │  Deploy to EKS (Helm)        │
+  │                              │
+  │  • aws eks update-kubeconfig │
+  │  • Create namespace          │
+  │  • helm upgrade --install    │
+  │  • Verify rollout status     │
+  │  • Health check via kubectl  │
+  │  • Auto rollback on failure  │
+  └──────────────────────────────┘
+```
+
+### Trigger Strategy
+
+| Event | What runs |
+|-------|-----------|
+| **Pull request** to `main` | Build & Test only (no Docker build, no deploy) |
+| **Push to `main`** | Full pipeline → deploy to **staging** |
+| **Tag `v*`** (e.g. `v1.0.0`) | Full pipeline → deploy to **production** (approval required) |
+
+### GitHub Environments
+
+Two GitHub Environments are configured in the repository settings (Settings > Environments):
+
+| Environment | Protection Rules | Purpose |
+|-------------|-----------------|---------|
+| `staging` | None | Auto-deploy on push to `main` |
+| `production` | **Required reviewers** enabled | Manual approval gate before production deploy |
+
+### Required GitHub Secrets
+
+Configure these in Settings > Secrets and variables > Actions:
+
+| Secret | Purpose |
+|--------|---------|
+| `AWS_ACCESS_KEY_ID` | AWS IAM access key for ECR, EKS, and CLI operations |
+| `AWS_SECRET_ACCESS_KEY` | AWS IAM secret key |
+
+### How to Deploy
+
+**Staging** — merge or push to `main`:
+```bash
+git push origin main
+```
+
+**Production** — create and push a version tag:
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+A reviewer must approve the deployment in the GitHub Actions UI before it proceeds.
+
+### Jobs Overview
+
+| Job | Trigger | Depends On | Environment |
+|-----|---------|-----------|-------------|
+| `build-and-test` | All | — | — |
+| `docker-build-push` | Push only | `build-and-test` | — |
+| `security-scan` | Push only | `docker-build-push` | — |
+| `deploy-staging` | Push to `main` | `docker-build-push`, `security-scan` | `staging` |
+| `deploy-production` | Tag `v*` | `docker-build-push`, `security-scan` | `production` |
+
+### Jenkins vs GitHub Actions Comparison
+
+| Feature | Jenkins | GitHub Actions |
+|---------|---------|---------------|
+| Environment selection | Manual parameter choice | Branch-based (main → staging, tag → production) |
+| Production approval | `input` step (admin/devops-leads) | GitHub Environment required reviewers |
+| Credentials | Jenkins Credentials store | GitHub Secrets |
+| Skip tests | `SKIP_TESTS` parameter | Not supported (tests always run) |
+| Dry run | `DRY_RUN` parameter | Not supported (use PR for validation) |
+| Security scan | ECR Inspector | ECR Inspector |
+| Rollback | Post-failure block | `if: failure()` step |
+| Build cache | `--cache-from` latest image | `--cache-from` latest image |
+
+---
+
+## 4. Deployment Strategy + Rollback
 
 ### Strategy: Rolling Update
 
@@ -552,7 +706,7 @@ kubectl rollout undo deployment/icounter-api -n icounter
 
 ---
 
-## 4. AWS Integration
+## 5. AWS Integration
 
 ### ECR (Elastic Container Registry)
 - Private registry: `<ACCOUNT_ID>.dkr.ecr.ap-south-1.amazonaws.com/icounter-api`
@@ -574,7 +728,7 @@ kubectl rollout undo deployment/icounter-api -n icounter
 
 ---
 
-## 5. ALB + Kubernetes Traffic Flow
+## 6. ALB + Kubernetes Traffic Flow
 
 ```
 Client Request (HTTP)
@@ -607,7 +761,7 @@ HTTP Response → Client
 
 ---
 
-## 6. Autoscaling
+## 7. Autoscaling
 
 ### Two-Level Autoscaling
 
@@ -718,7 +872,7 @@ Karpenter continuously monitors node utilization. If pods can be packed onto few
 
 ---
 
-## 7. Secrets & Configuration Management
+## 8. Secrets & Configuration Management
 
 ### Current Implementation
 
@@ -753,7 +907,7 @@ This approach:
 
 ---
 
-## 8. Security Hardening
+## 9. Security Hardening
 
 ### Pod & Container Security Context
 

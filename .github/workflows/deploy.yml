@@ -1,0 +1,217 @@
+name: Build and Deploy to EKS
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 610156626235.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: icounter-api
+  EKS_CLUSTER_NAME: icounter-cluster
+  HELM_RELEASE: icounter-api
+  K8S_NAMESPACE: icounter
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Run tests
+        working-directory: app
+        run: npm test
+
+  docker-build-push:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'push'
+    outputs:
+      image-tag: ${{ steps.meta.outputs.image-tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate image tag
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          IMAGE_TAG="${{ github.run_number }}-${SHORT_SHA}"
+          echo "image-tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${IMAGE_TAG}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Pull latest image for cache
+        run: docker pull ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest || true
+
+      - name: Build Docker image
+        run: |
+          docker build --platform linux/amd64 \
+            --cache-from ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest \
+            -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image-tag }} \
+            -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest \
+            .
+
+      - name: Push to ECR
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image-tag }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for ECR scan to complete
+        run: |
+          aws ecr wait image-scan-complete \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ needs.docker-build-push.outputs.image-tag }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Check for critical vulnerabilities
+        run: |
+          CRITICAL=$(aws ecr describe-image-scan-findings \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ needs.docker-build-push.outputs.image-tag }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'imageScanFindings.findingSeverityCounts.CRITICAL' \
+            --output text)
+
+          echo "CRITICAL vulnerabilities: ${CRITICAL}"
+
+          if [ "${CRITICAL}" != "None" ] && [ "${CRITICAL}" != "0" ]; then
+            echo "::error::Blocking deployment — ${CRITICAL} CRITICAL vulnerabilities found."
+            exit 1
+          fi
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [docker-build-push, security-scan]
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Create namespace
+        run: kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install ${{ env.HELM_RELEASE }} ./helm/icounter-api \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            -f helm/icounter-api/values-staging.yaml \
+            --set image.repository=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+            --set image.tag=${{ needs.docker-build-push.outputs.image-tag }} \
+            --set config.appVersion=${{ needs.docker-build-push.outputs.image-tag }} \
+            --wait \
+            --timeout 300s
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/${{ env.HELM_RELEASE }} -n ${{ env.K8S_NAMESPACE }} --timeout=120s
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=${{ env.HELM_RELEASE }}
+          kubectl get ingress -n ${{ env.K8S_NAMESPACE }}
+
+      - name: Health check
+        run: |
+          POD_NAME=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=${{ env.HELM_RELEASE }} -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec -n ${{ env.K8S_NAMESPACE }} ${POD_NAME} -- wget -qO- --timeout=5 http://localhost:3000/health
+
+      - name: Rollback on failure
+        if: failure()
+        run: helm rollback ${{ env.HELM_RELEASE }} 0 --namespace ${{ env.K8S_NAMESPACE }} || true
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [docker-build-push, security-scan]
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Create namespace
+        run: kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install ${{ env.HELM_RELEASE }} ./helm/icounter-api \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            -f helm/icounter-api/values-production.yaml \
+            --set image.repository=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+            --set image.tag=${{ needs.docker-build-push.outputs.image-tag }} \
+            --set config.appVersion=${{ needs.docker-build-push.outputs.image-tag }} \
+            --wait \
+            --timeout 300s
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/${{ env.HELM_RELEASE }} -n ${{ env.K8S_NAMESPACE }} --timeout=120s
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=${{ env.HELM_RELEASE }}
+          kubectl get ingress -n ${{ env.K8S_NAMESPACE }}
+
+      - name: Health check
+        run: |
+          POD_NAME=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=${{ env.HELM_RELEASE }} -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec -n ${{ env.K8S_NAMESPACE }} ${POD_NAME} -- wget -qO- --timeout=5 http://localhost:3000/health
+
+      - name: Rollback on failure
+        if: failure()
+        run: helm rollback ${{ env.HELM_RELEASE }} 0 --namespace ${{ env.K8S_NAMESPACE }} || true
