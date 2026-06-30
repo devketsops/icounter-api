@@ -930,49 +930,208 @@ Non-sensitive, environment-specific values injected via `envFrom`:
 | LOG_LEVEL | debug | warn |
 | APP_VERSION | Set by CI/CD | Set by CI/CD |
 
-### Secrets (AWS Secrets Manager + External Secrets Operator)
+### Secrets — Complete Flow
 
-Secrets are managed end-to-end through AWS Secrets Manager, never stored in Git:
+Secrets are managed through a **6-layer pipeline** that gets them from a developer's hands into a running container, without ever committing them to Git:
 
 ```
-Terraform creates secrets          External Secrets Operator          Pod
-in AWS Secrets Manager    ──>      syncs them to K8s Secrets   ──>    reads via envFrom
-(icounter/db-password)             (ExternalSecret CR)
-(icounter/api-key)                 (ClusterSecretStore)
+Developer (terraform apply -var="db_password=...")
+    │
+    ▼
+Layer 1: AWS Secrets Manager             ◄── secrets stored here, encrypted at rest
+    │
+    ▼
+Layer 2: IAM Role (IRSA)                 ◄── only the ESO pod can read them
+    │
+    ▼
+Layer 3: External Secrets Operator        ◄── runs in kube-system, syncs secrets
+    │
+    ▼
+Layer 4: ExternalSecret CR               ◄── declares what to sync and how often
+    │
+    ▼
+Layer 5: Kubernetes Secret                ◄── auto-created/updated by ESO
+    │
+    ▼
+Layer 6: Pod env vars (DB_PASSWORD, API_KEY)  ◄── app reads process.env.*
 ```
 
-**AWS Secrets Manager** (Terraform — `terraform/secrets.tf`):
+#### Layer 1 — Secrets Created via Terraform (`terraform/secrets.tf`)
 
-| Secret | JSON Key | Purpose |
-|--------|----------|---------|
-| `icounter/db-password` | `password` | Database password |
-| `icounter/api-key` | `key` | API key |
+Two secrets are provisioned in AWS Secrets Manager:
 
-**External Secrets Operator** (Helm — `helm/external-secrets/`):
-- Installed via wrapper Helm chart with official `external-secrets` as dependency
-- Runs on core nodes (CriticalAddonsOnly toleration + core-infra nodeSelector)
-- Uses IRSA to authenticate with AWS Secrets Manager (scoped to the two secrets only)
-- `ClusterSecretStore` CR connects ESO to Secrets Manager in `ap-south-1`
+| Secret Name | JSON Structure | Purpose |
+|-------------|---------------|---------|
+| `icounter/db-password` | `{"password": "..."}` | Database password |
+| `icounter/api-key` | `{"key": "..."}` | API key |
 
-**ExternalSecret CR** (Helm — `helm/icounter-api/templates/externalsecret.yaml`):
-- When `externalSecrets.enabled: true`, creates an `ExternalSecret` that syncs SM secrets into a K8s Secret
-- The K8s Secret is injected into pods via `envFrom` in the Deployment template
-- Refreshed every hour by default (`refreshInterval: 1h`)
+The actual values come from Terraform variables (`var.db_password`, `var.api_key`) which are marked `sensitive = true` — they never appear in plan output, state logs, or Git. You pass them at apply time:
 
-**How to update secrets:**
 ```bash
-# Update a secret value in AWS Secrets Manager
+terraform apply -var="db_password=MyS3cretPass" -var="api_key=sk-abc123"
+```
+
+#### Layer 2 — IAM Controls Who Can Read Them (`terraform/iam.tf`)
+
+A dedicated IAM role `icounter-external-secrets` is created using **IRSA** (IAM Roles for Service Accounts):
+
+- **Trust policy** — only the Kubernetes ServiceAccount `external-secrets` in the `kube-system` namespace can assume this role (enforced via OIDC federation with EKS)
+- **Permissions** — only `secretsmanager:GetSecretValue` and `secretsmanager:DescribeSecret`, scoped to the exact two secret ARNs (least privilege)
+
+```
+OIDC Trust Chain:
+  EKS OIDC Provider
+    └── Condition: sub = "system:serviceaccount:kube-system:external-secrets"
+    └── Condition: aud = "sts.amazonaws.com"
+        └── Grants: sts:AssumeRoleWithWebIdentity
+            └── To: icounter-external-secrets IAM role
+                └── Allows: GetSecretValue, DescribeSecret
+                    └── Only on: icounter/db-password, icounter/api-key ARNs
+```
+
+Even if another pod or ServiceAccount is compromised, it **cannot** read these secrets — only the ESO pod can.
+
+#### Layer 3 — External Secrets Operator Bridges AWS to Kubernetes
+
+**ClusterSecretStore** (`helm/external-secrets/templates/clustersecretstore.yaml`) configures ESO to talk to AWS:
+
+```yaml
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: "ap-south-1"
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets      # the IRSA-annotated ServiceAccount
+            namespace: kube-system
+```
+
+ESO uses the ServiceAccount's IRSA annotation to assume the IAM role and authenticate to AWS Secrets Manager — **no static AWS credentials needed inside the cluster**. The ESO pod runs on core infrastructure nodes (has `CriticalAddonsOnly` toleration + `core-infra` nodeSelector).
+
+#### Layer 4 — ExternalSecret CR Pulls Secrets into Kubernetes
+
+When `externalSecrets.enabled: true`, the Helm chart (`helm/icounter-api/templates/externalsecret.yaml`) creates an `ExternalSecret` custom resource:
+
+```yaml
+spec:
+  refreshInterval: "1h"                # re-sync from AWS every hour
+  secretStoreRef:
+    name: aws-secrets-manager          # references the ClusterSecretStore
+    kind: ClusterSecretStore
+  target:
+    name: icounter-api                 # name of the K8s Secret to create
+    creationPolicy: Owner              # ESO owns and manages this Secret
+  data:
+    - secretKey: DB_PASSWORD           # key in the K8s Secret
+      remoteRef:
+        key: icounter/db-password      # AWS Secrets Manager secret name
+        property: password             # JSON field to extract
+    - secretKey: API_KEY
+      remoteRef:
+        key: icounter/api-key
+        property: key
+```
+
+ESO watches this CR, reads the values from AWS Secrets Manager, and creates/updates a Kubernetes `Secret` named `icounter-api`.
+
+#### Layer 5 — Dual-Mode Secret Creation (ExternalSecret vs Static)
+
+The Helm chart supports two modes, controlled by `externalSecrets.enabled`:
+
+| Mode | When | How It Works | Files |
+|------|------|-------------|-------|
+| **ExternalSecret** (`enabled: true`) | Production | ESO syncs AWS Secrets Manager → K8s Secret automatically | `externalsecret.yaml` is rendered, `secret.yaml` is **not** |
+| **Static Secret** (`enabled: false`) | Staging / Dev | Plain K8s Secret with base64 values from Helm values | `secret.yaml` is rendered, `externalsecret.yaml` is **not** |
+
+The static fallback (`helm/icounter-api/templates/secret.yaml`):
+```yaml
+{{- if not .Values.externalSecrets.enabled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: icounter-api
+type: Opaque
+data:
+  DB_PASSWORD: {{ .Values.secrets.dbPassword }}    # base64-encoded
+  API_KEY: {{ .Values.secrets.apiKey }}             # base64-encoded
+{{- end }}
+```
+
+Both modes produce the same Kubernetes Secret name (`icounter-api`), so the Deployment template doesn't need to change.
+
+#### Layer 6 — Pod Consumes Secrets as Environment Variables
+
+The Deployment (`helm/icounter-api/templates/deployment.yaml`) injects both config and secrets:
+
+```yaml
+envFrom:
+  - configMapRef:
+      name: icounter-api       # non-sensitive: NODE_ENV, LOG_LEVEL, APP_VERSION
+  - secretRef:
+      name: icounter-api       # secrets: DB_PASSWORD, API_KEY
+```
+
+All keys in the Secret become environment variables. The app reads them as `process.env.DB_PASSWORD` and `process.env.API_KEY`.
+
+**Auto-restart on secret change:** The Deployment has checksum annotations:
+```yaml
+annotations:
+  checksum/config: {{ include ... "/configmap.yaml" | sha256sum }}
+  checksum/secret: {{ include ... "/secret.yaml" | sha256sum }}
+```
+When the secret content changes, the checksum changes, which triggers a rolling deployment — pods pick up new values automatically with zero downtime.
+
+### CI/CD Secrets (Separate Path)
+
+CI/CD pipelines use their own credential stores for **infrastructure access only** — these credentials never enter the container image or Kubernetes cluster:
+
+| System | Credential | Purpose |
+|--------|-----------|---------|
+| **GitHub Actions** | `secrets.AWS_ACCESS_KEY_ID` | AWS IAM access key for ECR push, EKS deploy |
+| **GitHub Actions** | `secrets.AWS_SECRET_ACCESS_KEY` | AWS IAM secret key |
+| **Jenkins** | `aws-credentials` (Jenkins Credentials) | AWS access key + secret, wrapped in `withCredentials` blocks |
+| **Jenkins** | `ecr-registry-url` (Secret Text) | ECR registry URL |
+
+Jenkins credentials are automatically cleaned up after each build via `cleanWs()`.
+
+### Security Guardrails Across the Pipeline
+
+| Layer | Protection |
+|-------|-----------|
+| **Git** | No secrets in code — `sensitive = true` in Terraform, empty defaults in Helm values |
+| **AWS** | Encrypted at rest in Secrets Manager, IAM scoped to exact secret ARNs |
+| **Kubernetes** | IRSA — no static AWS credentials stored inside the cluster |
+| **Pod** | Non-root user (UID 100), read-only filesystem, all Linux capabilities dropped |
+| **Network** | NetworkPolicy restricts ingress to VPC CIDR only |
+| **Image** | Multi-stage Docker build, no secrets baked into layers |
+| **CI/CD** | Credentials scoped to CI runner only, never passed to application |
+
+### How to Rotate a Secret
+
+```bash
+# 1. Update the value in AWS Secrets Manager
 aws secretsmanager put-secret-value \
   --secret-id icounter/db-password \
   --secret-string '{"password": "new-password"}' \
   --region ap-south-1
 
-# ESO automatically syncs the new value to the K8s Secret within the refresh interval
-# To force an immediate sync:
-kubectl annotate externalsecret icounter-api -n icounter force-sync=$(date +%s) --overwrite
+# 2. ESO automatically detects the change within 1 hour (refreshInterval)
+#    and updates the Kubernetes Secret
+
+# 3. The checksum annotation triggers a rolling restart
+#    so pods pick up the new value with zero downtime
+
+# To force an immediate sync instead of waiting:
+kubectl annotate externalsecret icounter-api -n icounter \
+  force-sync=$(date +%s) --overwrite
+
+# To verify the secret was synced:
+kubectl get externalsecret icounter-api -n icounter -o jsonpath='{.status.conditions}'
 ```
 
-Checksum annotations on the pod template ensure pods restart when the K8s Secret content changes.
+> **Note:** No automatic rotation is configured (e.g., AWS Secrets Manager rotation Lambda). Rotation is manual — you update the value in AWS, and ESO propagates it to the cluster.
 
 ---
 
