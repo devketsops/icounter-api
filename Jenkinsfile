@@ -62,14 +62,11 @@ pipeline {
                     sh """
                         aws ecr get-login-password --region ${AWS_REGION} \
                             | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                        docker pull ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest || true
                     """
                 }
                 sh """
                     docker build --platform linux/amd64 \
-                        --cache-from ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest \
                         -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
-                        -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest \
                         .
                 """
             }
@@ -85,7 +82,6 @@ pipeline {
                         aws ecr get-login-password --region ${AWS_REGION} \
                             | docker login --username AWS --password-stdin ${ECR_REGISTRY}
                         docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
                     """
                 }
             }
@@ -204,7 +200,6 @@ pipeline {
         }
         always {
             sh "docker rmi ${ECR_REGISTRY}/${ECR_REPOSITORY}:${env.IMAGE_TAG} || true"
-            sh "docker rmi ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest || true"
             cleanWs()
         }
     }

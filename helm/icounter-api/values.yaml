@@ -27,8 +27,22 @@ config:
   appVersion: "1.0.0"
 
 secrets:
-  dbPassword: bW9ja2VkLXBhc3N3b3Jk
-  apiKey: bW9ja2VkLWFwaS1rZXk=
+  dbPassword: ""
+  apiKey: ""
+
+externalSecrets:
+  enabled: false
+  refreshInterval: "1h"
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: ClusterSecretStore
+  data:
+    - secretKey: DB_PASSWORD
+      remoteKey: icounter/db-password
+      property: password
+    - secretKey: API_KEY
+      remoteKey: icounter/api-key
+      property: key
 
 securityContext:
   pod:

@@ -1,0 +1,32 @@
+clusterName: "icounter-cluster"
+region: "ap-south-1"
+
+external-secrets:
+  serviceAccount:
+    create: true
+    name: external-secrets
+    annotations:
+      eks.amazonaws.com/role-arn: ""  # Set at install time
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      operator: "Exists"
+      effect: "NoSchedule"
+  nodeSelector:
+    node-role: "core-infra"
+  webhook:
+    tolerations:
+      - key: "CriticalAddonsOnly"
+        operator: "Exists"
+        effect: "NoSchedule"
+    nodeSelector:
+      node-role: "core-infra"
+  certController:
+    tolerations:
+      - key: "CriticalAddonsOnly"
+        operator: "Exists"
+        effect: "NoSchedule"
+    nodeSelector:
+      node-role: "core-infra"
+
+secretStore:
+  name: aws-secrets-manager

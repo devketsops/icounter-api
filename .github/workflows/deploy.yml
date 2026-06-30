@@ -68,21 +68,15 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Pull latest image for cache
-        run: docker pull ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest || true
-
       - name: Build Docker image
         run: |
           docker build --platform linux/amd64 \
-            --cache-from ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest \
             -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image-tag }} \
-            -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest \
             .
 
       - name: Push to ECR
         run: |
           docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image-tag }}
-          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
 
   security-scan:
     name: Security Scan

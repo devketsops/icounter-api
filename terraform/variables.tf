@@ -28,6 +28,32 @@ variable "eks_cluster_version" {
   default     = "1.35"
 }
 
+variable "eks_public_access_cidrs" {
+  description = "CIDR blocks allowed to access the EKS public API endpoint"
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
+variable "ecr_force_delete" {
+  description = "Allow force-deleting the ECR repository even if it contains images. Set to false for production."
+  type        = bool
+  default     = false
+}
+
+variable "db_password" {
+  description = "Database password stored in AWS Secrets Manager"
+  type        = string
+  sensitive   = true
+  default     = "change-me"
+}
+
+variable "api_key" {
+  description = "API key stored in AWS Secrets Manager"
+  type        = string
+  sensitive   = true
+  default     = "change-me"
+}
+
 variable "core_node_instance_types" {
   description = "Instance types for the core infrastructure managed node group"
   type        = list(string)

@@ -53,7 +53,7 @@ Internet ──> AWS ALB (Ingress) ──> NetworkPolicy ──> K8s Service ─
 ## Prerequisites
 
 - AWS CLI v2 configured with credentials
-- Terraform >= 1.10
+- Terraform >= 1.15
 - kubectl
 - Helm v3
 - Docker
@@ -84,15 +84,20 @@ Internet ──> AWS ALB (Ingress) ──> NetworkPolicy ──> K8s Service ─
 │   ├── metrics-server/     # Metrics Server Helm chart (required for HPA)
 │   │   ├── Chart.yaml      # Official metrics-server as dependency
 │   │   └── values.yaml     # kubelet-insecure-tls config
-│   └── karpenter/          # Karpenter Helm chart (wraps official chart + CRDs)
-│       ├── Chart.yaml      # Official karpenter chart as dependency
-│       ├── templates/      # NodePool and EC2NodeClass CRDs
-│       └── values.yaml     # Default values
+│   ├── karpenter/          # Karpenter Helm chart (wraps official chart + CRDs)
+│   │   ├── Chart.yaml      # Official karpenter chart as dependency
+│   │   ├── templates/      # NodePool and EC2NodeClass CRDs
+│   │   └── values.yaml     # Default values
+│   └── external-secrets/   # External Secrets Operator (syncs AWS SM → K8s Secrets)
+│       ├── Chart.yaml      # Official external-secrets as dependency
+│       ├── templates/      # ClusterSecretStore CR
+│       └── values.yaml     # IRSA annotation, tolerations, region
 └── terraform/              # AWS infrastructure (pure AWS resources, no Helm/K8s)
     ├── vpc.tf              # VPC, subnets, NAT, route tables
-    ├── iam.tf              # All IAM roles (EKS, Core Node, Karpenter, ALB)
+    ├── iam.tf              # All IAM roles (EKS, Core Node, Karpenter, ALB, ESO)
     ├── eks.tf              # EKS cluster, core node group, add-ons, OIDC
     ├── ecr.tf              # ECR repository + lifecycle policy
+    ├── secrets.tf          # AWS Secrets Manager secrets (DB password, API key)
     ├── providers.tf        # AWS and TLS providers
     ├── variables.tf        # Input variables
     ├── outputs.tf          # Terraform outputs
@@ -162,6 +167,16 @@ helm upgrade --install karpenter ../helm/karpenter/ \
   --set karpenter.settings.clusterEndpoint=$EKS_ENDPOINT \
   --set "karpenter.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$KARPENTER_ROLE_ARN" \
   --wait
+
+# 4. Install External Secrets Operator
+ESO_ROLE_ARN=$(terraform output -raw external_secrets_role_arn)
+helm repo add external-secrets https://charts.external-secrets.io
+helm repo update
+helm dependency build ../helm/external-secrets/
+helm upgrade --install external-secrets ../helm/external-secrets/ \
+  -n kube-system \
+  --set "external-secrets.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$ESO_ROLE_ARN" \
+  --wait
 ```
 
 ### Infrastructure Components
@@ -171,15 +186,17 @@ helm upgrade --install karpenter ../helm/karpenter/ \
 | VPC | 10.0.0.0/16, 2 AZs, single NAT gateway |
 | EKS | v1.35, managed node group for core infrastructure |
 | ECR | `icounter-api` repository with lifecycle policy |
+| Secrets Manager | `icounter/db-password` and `icounter/api-key` secrets |
 | Karpenter IAM | Controller IRSA role + node role (Terraform), controller + CRDs (Helm) |
 | ALB Controller IAM | IRSA role (Terraform), controller deployment (Helm) |
+| External Secrets IAM | IRSA role (Terraform), operator + ClusterSecretStore (Helm) |
 | Metrics Server | Deployed via Helm, enables HPA pod autoscaling |
 
 ### Terraform Code Breakdown
 
 #### `providers.tf` — Provider Configuration
 
-- **AWS Provider (~> 5.0)** — the only provider needed. Creates all AWS resources, configured for `ap-south-1` (Mumbai)
+- **AWS Provider (~> 6.0)** — the only provider needed. Creates all AWS resources, configured for `ap-south-1` (Mumbai)
 - AWS handles EKS OIDC certificate verification internally using its trusted CA library, so no TLS provider is needed
 
 #### `variables.tf` + `terraform.tfvars` — Input Variables
@@ -297,7 +314,7 @@ EKS Cluster (icounter-cluster, v1.35)
 
 #### `iam.tf` — IAM Roles & Policies (who is allowed to do what)
 
-Each IAM role is like an ID badge that says "I am allowed to do these specific things." This file creates **5 roles**.
+Each IAM role is like an ID badge that says "I am allowed to do these specific things." This file creates **6 roles**.
 
 ```
 IAM Roles
@@ -319,9 +336,13 @@ IAM Roles
 │   ├── Trust: OIDC federation (only kube-system:karpenter SA)
 │   └── EC2 fleet management, IAM instance profiles, EKS, SSM, Pricing API
 │
-└── ALB Controller Role (IRSA — used by the ALB controller pod)
-    ├── Trust: OIDC federation (only kube-system:aws-load-balancer-controller SA)
-    └── ELB, EC2 security groups, ACM certificates, WAF/Shield
+├── ALB Controller Role (IRSA — used by the ALB controller pod)
+│   ├── Trust: OIDC federation (only kube-system:aws-load-balancer-controller SA)
+│   └── ELB, EC2 security groups, ACM certificates, WAF/Shield
+│
+└── External Secrets Operator Role (IRSA — used by the ESO pod)
+    ├── Trust: OIDC federation (only kube-system:external-secrets SA)
+    └── secretsmanager:GetSecretValue, secretsmanager:DescribeSecret (scoped to app secrets)
 ```
 
 **Resource-by-resource:**
@@ -334,6 +355,7 @@ IAM Roles
 | `aws_iam_role.karpenter_node` | Same 4 policies as core node, but for EC2 instances that Karpenter dynamically launches. Kept separate so changes to one don't break the other. Also has an **instance profile** because Karpenter creates its own launch templates (the managed node group handles instance profiles internally) |
 | `aws_iam_role.karpenter_controller` | The Karpenter pod assumes this via **IRSA**. Only the `kube-system:karpenter` ServiceAccount can use it (enforced by OIDC conditions). Permissions: launch/terminate EC2 instances, manage instance profiles, read cluster info, look up AMI IDs via SSM, query instance pricing to pick the cheapest option |
 | `aws_iam_role.alb_controller` | The ALB controller pod assumes this via **IRSA**. Only `kube-system:aws-load-balancer-controller` can use it. Permissions: create/modify/delete ALBs, manage security groups, register pod IPs as targets, manage TLS certificates, optionally attach WAF/Shield. Condition blocks ensure it only touches resources it created (tagged with `elbv2.k8s.aws/cluster`) |
+| `aws_iam_role.external_secrets` | The External Secrets Operator pod assumes this via **IRSA**. Only `kube-system:external-secrets` can use it. Permissions: read secrets from AWS Secrets Manager (`GetSecretValue`, `DescribeSecret`), scoped to only the `icounter/db-password` and `icounter/api-key` secrets |
 
 - **IRSA** restricts AWS permissions to specific K8s service accounts via OIDC conditions — only the designated pod gets AWS access, not every pod in the cluster
 - **Karpenter has two roles:** the controller role (to launch/terminate instances) and the node role (for launched instances to join the cluster and pull images)
@@ -343,8 +365,18 @@ IAM Roles
 
 | Resource | What it does in simple words |
 |----------|-----|
-| `aws_ecr_repository.main` | Creates a private Docker registry named `icounter-api`. `scan_on_push = true` means every pushed image gets scanned for security vulnerabilities. `image_tag_mutability = MUTABLE` allows overwriting tags like `latest`. `force_delete = true` lets `terraform destroy` clean up even if images exist |
+| `aws_ecr_repository.main` | Creates a private Docker registry named `icounter-api`. `scan_on_push = true` means every pushed image gets scanned for security vulnerabilities. `image_tag_mutability = IMMUTABLE` prevents overwriting existing tags (supply-chain safety). `force_delete` is controlled by a variable (default `false` for production safety) |
 | `aws_ecr_lifecycle_policy.main` | Cleanup rule: when there are more than 10 untagged images, delete the oldest ones. Prevents storage costs from growing forever |
+
+#### `secrets.tf` — AWS Secrets Manager
+
+| Resource | What it does in simple words |
+|----------|-----|
+| `aws_secretsmanager_secret.db_password` | Creates a secret named `icounter/db-password` in AWS Secrets Manager. Stores the database password outside the cluster with encryption at rest |
+| `aws_secretsmanager_secret.api_key` | Creates a secret named `icounter/api-key`. Stores the API key with the same protections |
+| `aws_secretsmanager_secret_version.*` | Sets the initial value for each secret as JSON (e.g. `{"password": "..."}` and `{"key": "..."}`). Values are passed via Terraform variables marked `sensitive` — never stored in Git |
+
+The External Secrets Operator reads these secrets and syncs them into Kubernetes Secrets, which pods consume via `envFrom`.
 
 #### `outputs.tf` — Exported Values
 
@@ -358,6 +390,7 @@ These are printed after `terraform apply` and consumed by Helm charts, kubectl, 
 | `vpc_id` | Needed by the ALB controller Helm chart to know which VPC to create load balancers in |
 | `alb_controller_role_arn` | Passed to ALB controller Helm chart for IRSA ServiceAccount annotation |
 | `karpenter_controller_role_arn` | Passed to Karpenter Helm chart for IRSA ServiceAccount annotation |
+| `external_secrets_role_arn` | Passed to External Secrets Operator Helm chart for IRSA ServiceAccount annotation |
 | `core_node_role_arn` | Core node group's IAM role ARN — useful for debugging and auditing |
 | `kubeconfig_command` | Ready-to-run command to configure kubectl on your machine |
 
@@ -376,31 +409,38 @@ vpc.tf ─────────────> eks.tf ────────�
     │                     │
     ▼                     ▼
 ecr.tf               outputs.tf ──> Helm installs use these values
-(image storage)
+(image storage)      │
+                     │
+secrets.tf           │
+(AWS Secrets Mgr)    │
 ```
 
 **Deployment flow after `terraform apply`:**
 
 ```
 1. VPC, subnets, IGW, NAT created
-2. IAM roles created (cluster, core node, karpenter node, karpenter controller, ALB controller)
+2. IAM roles created (cluster, core node, karpenter node, karpenter controller, ALB controller, ESO)
 3. EKS cluster created
 4. Access entries registered (core nodes, karpenter nodes, admin)
 5. OIDC provider created (enables IRSA)
 6. Core node group launches 2x t3.medium (tainted, labeled)
 7. EKS addons install (vpc-cni, kube-proxy, CoreDNS → on core nodes)
 8. ECR repository created
+9. Secrets Manager secrets created (icounter/db-password, icounter/api-key)
         │
         ▼
 Helm installs (using Terraform outputs)
 ├── Karpenter → schedules on core nodes (has toleration + nodeSelector)
 ├── ALB Controller → schedules on core nodes
-└── Metrics Server → schedules on core nodes
+├── Metrics Server → schedules on core nodes
+└── External Secrets Operator → schedules on core nodes, creates ClusterSecretStore
         │
         ▼
 App deployment (via Jenkins or GitHub Actions)
 ├── Image pushed to ECR
-├── Helm deploys pods — pods are unschedulable (no untainted nodes)
+├── Helm deploys pods + ExternalSecret CR
+├── ESO syncs Secrets Manager → K8s Secret
+├── Pods start with secrets from envFrom
 ├── Karpenter sees pending pods → launches new EC2 (application nodes)
 └── ALB Controller creates load balancer → traffic flows
 ```
@@ -412,6 +452,7 @@ App deployment (via Jenkins or GitHub Actions)
 helm uninstall icounter-api -n icounter
 
 # Remove cluster components
+helm uninstall external-secrets -n kube-system
 helm uninstall karpenter -n kube-system
 helm uninstall alb-controller -n kube-system
 helm uninstall metrics-server -n kube-system
@@ -879,36 +920,59 @@ Karpenter continuously monitors node utilization. If pods can be packed onto few
 
 ## 8. Secrets & Configuration Management
 
-### Current Implementation
+### Configuration (ConfigMap)
 
-**ConfigMap** (non-sensitive, environment-specific):
+Non-sensitive, environment-specific values injected via `envFrom`:
+
 | Key | Staging | Production |
 |-----|---------|------------|
 | NODE_ENV | staging | production |
 | LOG_LEVEL | debug | warn |
-| APP_VERSION | Set by Jenkins | Set by Jenkins |
+| APP_VERSION | Set by CI/CD | Set by CI/CD |
 
-**Kubernetes Secrets** (sensitive, mocked for this assignment):
-| Key | Value |
-|-----|-------|
-| DB_PASSWORD | mocked-password (base64 encoded) |
-| API_KEY | mocked-api-key (base64 encoded) |
+### Secrets (AWS Secrets Manager + External Secrets Operator)
 
-Both are injected into pods via `envFrom` in the Deployment template. Checksum annotations on the pod template ensure pods restart when config/secrets change.
-
-### Production Recommendation
-
-For production workloads, use **AWS Secrets Manager + External Secrets Operator**:
+Secrets are managed end-to-end through AWS Secrets Manager, never stored in Git:
 
 ```
-AWS Secrets Manager ──> External Secrets Operator ──> K8s Secret ──> Pod
+Terraform creates secrets          External Secrets Operator          Pod
+in AWS Secrets Manager    ──>      syncs them to K8s Secrets   ──>    reads via envFrom
+(icounter/db-password)             (ExternalSecret CR)
+(icounter/api-key)                 (ClusterSecretStore)
 ```
 
-This approach:
-- Stores secrets outside the cluster with encryption at rest
-- Supports automatic rotation
-- Provides audit logging via CloudTrail
-- Eliminates base64-encoded secrets from Git/Helm values
+**AWS Secrets Manager** (Terraform — `terraform/secrets.tf`):
+
+| Secret | JSON Key | Purpose |
+|--------|----------|---------|
+| `icounter/db-password` | `password` | Database password |
+| `icounter/api-key` | `key` | API key |
+
+**External Secrets Operator** (Helm — `helm/external-secrets/`):
+- Installed via wrapper Helm chart with official `external-secrets` as dependency
+- Runs on core nodes (CriticalAddonsOnly toleration + core-infra nodeSelector)
+- Uses IRSA to authenticate with AWS Secrets Manager (scoped to the two secrets only)
+- `ClusterSecretStore` CR connects ESO to Secrets Manager in `ap-south-1`
+
+**ExternalSecret CR** (Helm — `helm/icounter-api/templates/externalsecret.yaml`):
+- When `externalSecrets.enabled: true`, creates an `ExternalSecret` that syncs SM secrets into a K8s Secret
+- The K8s Secret is injected into pods via `envFrom` in the Deployment template
+- Refreshed every hour by default (`refreshInterval: 1h`)
+
+**How to update secrets:**
+```bash
+# Update a secret value in AWS Secrets Manager
+aws secretsmanager put-secret-value \
+  --secret-id icounter/db-password \
+  --secret-string '{"password": "new-password"}' \
+  --region ap-south-1
+
+# ESO automatically syncs the new value to the K8s Secret within the refresh interval
+# To force an immediate sync:
+kubectl annotate externalsecret icounter-api -n icounter force-sync=$(date +%s) --overwrite
+```
+
+Checksum annotations on the pod template ensure pods restart when the K8s Secret content changes.
 
 ---
 

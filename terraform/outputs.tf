@@ -33,6 +33,11 @@ output "core_node_role_arn" {
   value       = aws_iam_role.core_node.arn
 }
 
+output "external_secrets_role_arn" {
+  description = "External Secrets Operator IAM role ARN (pass to Helm install)"
+  value       = aws_iam_role.external_secrets.arn
+}
+
 output "kubeconfig_command" {
   description = "Command to configure kubectl"
   value       = "aws eks update-kubeconfig --name ${aws_eks_cluster.main.name} --region ${var.aws_region}"

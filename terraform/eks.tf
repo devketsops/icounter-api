@@ -7,6 +7,7 @@ resource "aws_eks_cluster" "main" {
     subnet_ids              = concat(aws_subnet.private[*].id, aws_subnet.public[*].id)
     endpoint_private_access = true
     endpoint_public_access  = true
+    public_access_cidrs     = var.eks_public_access_cidrs
   }
 
   access_config {
