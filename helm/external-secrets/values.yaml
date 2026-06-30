@@ -2,6 +2,7 @@ clusterName: "icounter-cluster"
 region: "ap-south-1"
 
 external-secrets:
+  installCRDs: true
   serviceAccount:
     create: true
     name: external-secrets

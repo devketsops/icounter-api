@@ -168,15 +168,24 @@ helm upgrade --install karpenter ../helm/karpenter/ \
   --set "karpenter.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$KARPENTER_ROLE_ARN" \
   --wait
 
-# 4. Install External Secrets Operator
+# 4. Install External Secrets Operator (two-step: operator first, then ClusterSecretStore)
 ESO_ROLE_ARN=$(terraform output -raw external_secrets_role_arn)
 helm repo add external-secrets https://charts.external-secrets.io
 helm repo update
 helm dependency build ../helm/external-secrets/
+
+# Step 1: Installs ESO operator + CRDs (ClusterSecretStore is skipped — CRD not yet registered)
 helm upgrade --install external-secrets ../helm/external-secrets/ \
   -n kube-system \
   --set "external-secrets.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$ESO_ROLE_ARN" \
   --wait
+
+# Step 2: CRDs now exist, this run creates the ClusterSecretStore
+helm upgrade --install external-secrets ../helm/external-secrets/ \
+  -n kube-system \
+  --set "external-secrets.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$ESO_ROLE_ARN" \
+  --wait
+# Subsequent upgrades only need a single run
 ```
 
 ### Infrastructure Components
